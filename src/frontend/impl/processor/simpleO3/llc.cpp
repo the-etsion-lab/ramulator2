@@ -10,6 +10,7 @@ m_latency(latency), m_cows_cache(cows_cache), m_size_bytes(size_bytes), m_linesi
   m_logger = Logging::create_logger("SimpleO3LLC");
 
   m_set_size = m_size_bytes / (m_linesize_bytes * m_associativity);
+  s_llc_effective_bytes = m_size_bytes;   // WI-010: no carve-out unless set_carveout() is called
   // WI-005: the index is taken with a mask (sets-1), so the set count must be a power of two and the capacity exact;
   // e.g. 2MB/core with associativity 7 would silently use a garbage mask. For 7 ways use 1792KB/core.
   if (m_set_size <= 0 || (m_set_size & (m_set_size - 1)) != 0 ||
