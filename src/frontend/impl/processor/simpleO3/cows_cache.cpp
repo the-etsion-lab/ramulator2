@@ -244,6 +244,16 @@ CoWsCache::CoWsCache(uint32_t nlines,
             <<std::endl;
 }
 
+void CoWsCache::set_source_index_bits(uint32_t src_index_bits) {
+    s_src_index_bits = src_index_bits;
+    s_entry_bits = Line::getTagBits() + src_index_bits + 1 + AddrParser::getNumBlocksPerPage();
+    s_cache_bytes = ((uint64_t)m_nsets * m_assoc * s_entry_bits + 7) / 8;
+    std::cerr<<"# COWs cache: entry bits="<<s_entry_bits
+             <<" (tag+valid+dirty="<<Line::getTagBits()<<", src row index="<<src_index_bits<<", src valid=1"
+             <<", bitmap="<<AddrParser::getNumBlocksPerPage()<<"), entries="<<(uint64_t)m_nsets * m_assoc
+             <<", bytes="<<s_cache_bytes<<std::endl;
+}
+
 void CoWsCache::check_pending_lines(Clk_t clk) {
     for(auto it = m_pending_lines.begin(); it != m_pending_lines.end(); ) {
         auto* line = *it;

@@ -387,6 +387,13 @@ public:
     uint64_t s_table_writes = 0;          // WI-004 D3: dirty CoWs entries written back to the table (evictions + C1 updates)
     uint64_t s_table_reads = 0;           // WI-004 D3: entries fetched from the table (real misses on all paths + C1 fetches)
 
+    // WI-004 D9: entry = tag (incl. valid+dirty) + source-page index + source-valid bit + written-block bitmap.
+    // The source page is a row in the same bank (D-08 C1), so the index is log2(rows per bank).
+    uint64_t s_src_index_bits = 0;
+    uint64_t s_entry_bits = 0;
+    uint64_t s_cache_bytes = 0;
+    void set_source_index_bits(uint32_t src_index_bits);
+
     uint64_t s_cows_cycles = 0;
     uint64_t s_cows_cycles_self = 0;
 

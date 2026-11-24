@@ -5,6 +5,9 @@
 #include "translation/translation.h"
 #include "frontend/impl/processor/simpleO3/core.h"
 #include "frontend/impl/processor/simpleO3/llc.h"
+#include "memory_system/memory_system.h"
+#include "dram/dram.h"
+#include "addr_mapper/addr_mapper.h"
 
 
 namespace Ramulator {
@@ -14,6 +17,9 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
 
   private:
     ITranslation*  m_translation;
+    uint64_t m_cows_page_bytes = 0;            // WI-004 D10
+    bool m_cows_check_page_geometry = true;    // WI-004 D10
+    bool m_cows_geometry_checked = false;      // WI-004 D10
 
     int m_num_cores = -1;
     std::vector<SimpleO3Core*> m_cores;
@@ -55,6 +61,9 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
       uint32_t llc2cows_ratio = param<uint32_t>("cows_cache2llc_ratio").desc("Ratio between the number of LLC cache lines and CoWs cache entries.").required();
       uint32_t cows_cache_assoc = param<uint32_t>("cows_cache_assoc").desc("Associativity of CoWs cache.").required();
       uint32_t dram_page_bytes = parse_capacity_str(param<std::string>("dram_page_bytes").desc("size of DRAM page.").required());
+      m_cows_page_bytes = dram_page_bytes;
+      m_cows_check_page_geometry = param<bool>("cows_check_page_geometry")
+        .desc("Require a CoWs page to be exactly one DRAM row in one bank (WI-004 D10).").default_val(true);
       uint32_t always_miss = param<bool>("cows_always_miss").desc("Always miss in CoWs cache.").required();
       std::string cows_replacement = param<std::string>("cows_replacement").desc("Replacement policy in CoWs cache.").required();
       CoWsCache::ReplPolicy *cows_policy = nullptr;
@@ -171,6 +180,9 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
         register_stat(m_cows_cache->s_evicts).name("cows_evicts");
         static auto cows_missrate = DIV(m_cows_cache->s_misses, m_cows_cache->s_access);
         register_stat(cows_missrate, false).name("cows_missrate");
+        register_stat(m_cows_cache->s_src_index_bits, false).name("cows_src_index_bits");
+        register_stat(m_cows_cache->s_entry_bits, false).name("cows_cache_entry_bits");
+        register_stat(m_cows_cache->s_cache_bytes, false).name("cows_cache_bytes");
 
         static auto cows2llc_miss_ratio = DIV(m_cows_cache->s_misses_on_llc_miss, tot_llc_misses);
         register_stat(cows2llc_miss_ratio, false).name("cows2llc_miss_ratio");
@@ -216,6 +228,11 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
 
     void tick() override {
       m_clk++;
+
+      if (m_cows_cache != nullptr && !m_cows_geometry_checked) {
+        check_cows_page_geometry(m_memory_system);
+        m_cows_geometry_checked = true;
+      }
 
       if(m_clk % 1000000 == 0) {
         m_logger->info("Processor Heartbeat {} cycles.", m_clk);
@@ -289,7 +306,45 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
 
     void connect_memory_system(IMemorySystem* memory_system) override {
       m_llc->connect_memory_system(memory_system);
+      m_memory_system = memory_system;   // WI-004 D10: geometry is checked at the first tick (the memory system's
+                                         // address mapper is set up only after the front end is connected)
     };
+
+    /**
+     * WI-004 D9/D10: a CoWs page must be exactly one DRAM row in one bank under the address mapping (refresh can only be
+     * skipped per physical row). Map the first and last 64B block of random pages and the first block of the next page:
+     * the first two must share channel/rank/bankgroup/bank/row, the next page must not. Also sets the source-index width
+     * (log2 rows per bank) used for the entry size.
+     */
+    void check_cows_page_geometry(IMemorySystem* memory_system) {
+      IDRAM* dram = memory_system->get_dram();
+      IAddrMapper* mapper = memory_system->get_addr_mapper();
+      if (dram == nullptr || mapper == nullptr) {
+        std::cerr << "# WARNING: memory system has no DRAM/address mapper; CoWs page geometry not checked" << std::endl;
+        return;
+      }
+      int rows = dram->get_level_size("row");
+      m_cows_cache->set_source_index_bits(calc_log2(rows));
+      if (!m_cows_check_page_geometry) {
+        std::cerr << "# WARNING: cows_check_page_geometry=false; CoWs page geometry not checked" << std::endl;
+        return;
+      }
+      int col_level = dram->m_levels("column");
+      uint64_t page = m_cows_page_bytes;
+      auto map = [&](Addr_t a) { Request r(a, Request::Type::Read); mapper->apply(r); r.addr_vec.resize(col_level); return r.addr_vec; };
+      uint64_t x = 0x9E3779B97F4A7C15ull;   // fixed-seed xorshift: deterministic check
+      for (int i = 0; i < 1024; i++) {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        Addr_t p = (Addr_t)((x % (1ull << 34)) & ~(page - 1));
+        auto first = map(p), last = map(p + page - 64), next = map(p + page);
+        if (first != last || first == next) {
+          throw ConfigurationError("CoWs page ({} bytes) is not exactly one DRAM row in one bank under the address mapping "
+                                   "(page 0x{:x}: first/last block {}, next page {}). Set dram_page_bytes to the row size.",
+                                   page, p, first == last ? "same row" : "different rows", first == next ? "same row" : "different row");
+        }
+      }
+      std::cerr << "# COWs page geometry OK: " << page << "-byte page == one row in one bank (" << rows << " rows/bank)" << std::endl;
+    }
 
     int get_num_cores() override {
       return m_num_cores;
