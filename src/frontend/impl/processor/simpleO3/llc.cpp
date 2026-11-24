@@ -172,7 +172,8 @@ bool SimpleO3LLC::send(Request req) {
     bool cows_miss = false;
     if(m_cows_cache != nullptr) {
       bool cows_miss_not_handled = false;
-      std::tie(cows_miss, cows_latency, cows_miss_not_handled) = m_cows_cache->llc_miss(req.addr, (req.type_id == Request::Type::Write), m_clk, total_misses());
+      // WI-004 D2: pass the original request type (req was converted Write->Read above); used for stats only
+      std::tie(cows_miss, cows_latency, cows_miss_not_handled) = m_cows_cache->llc_miss(req.addr, dirty, m_clk, total_misses());
       if(cows_miss_not_handled) {
         // cannot allocate line in cows cache (e.g., all lines in the set are pending). For simplicity we treat it as a miss and retry later.
         return false;
@@ -334,7 +335,8 @@ void SimpleO3LLC::evict_line(CacheSet_t& set, CacheSet_t::iterator victim_it) {
     bool cows_miss_not_handled = false;
     if(m_cows_cache != nullptr) {
       std::tie(cows_miss, cows_latency, cows_miss_not_handled) = m_cows_cache->llc_evict(victim_it->addr, victim_it->dirty, m_clk, total_misses());
-      // TODO: what do we do if the cows_miss cannot be handled? for now, just fake it and we'll get another miss next time.
+      // WI-004 C1: if the CoWs entry cannot be installed (all ways pending), llc_evict still updates the table entry and
+      // returns the table-fetch latency; the writeback cannot be retried, so it proceeds after that latency.
       s_llc_total_cows_latency += cows_latency;
     }
 

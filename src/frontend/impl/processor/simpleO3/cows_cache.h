@@ -243,7 +243,7 @@ public:
         // bool 3: unhandled_miss: whether the miss was handled (e.g., if all lines in the set are pending, the miss cannot be handled and should be retried later)
         virtual std::tuple<bool,bool,bool> llc_hit(CacheSet_t& set, Line* page, uint32_t block_id, bool is_write) const = 0;
         virtual std::tuple<bool,bool,bool> llc_miss(CacheSet_t& set, Line* page, uint32_t block_id, bool is_write) const = 0;
-        virtual std::tuple<bool,bool,bool> llc_evict(CacheSet_t& set, Line* page, uint32_t block_id) const = 0;
+        virtual std::tuple<bool,bool,bool> llc_evict(CacheSet_t& set, Line* page, uint32_t block_id, bool is_write) const = 0;
 
         protected:
         virtual CacheSet_t::iterator victim(CacheSet_t& set) const {
@@ -323,7 +323,7 @@ public:
         virtual std::string name() const override { return "LRU_nohit"; }
         std::tuple<bool,bool,bool> llc_hit(CacheSet_t& set, Line* page, uint32_t block_id, bool is_write) const override;
         std::tuple<bool,bool,bool> llc_miss(CacheSet_t& set, Line* page, uint32_t block_id, bool is_write) const override;
-        std::tuple<bool,bool,bool> llc_evict(CacheSet_t& set, Line* page, uint32_t block_id) const override;
+        std::tuple<bool,bool,bool> llc_evict(CacheSet_t& set, Line* page, uint32_t block_id, bool is_write) const override;
     };
 
 private:
@@ -380,6 +380,8 @@ public:
     uint64_t s_miss_not_handled_on_llc_hit = 0;
     uint64_t s_miss_not_handled_on_llc_miss = 0;
     uint64_t s_miss_not_handled_on_llc_evict = 0;
+    uint64_t s_lookups_write_alloc = 0;   // WI-004 D2: LLC-miss lookups for write-allocate fills (bit NOT set there)
+    uint64_t s_bits_set = 0;              // WI-004 D2: written-block bits set (dirty LLC writebacks to a block not yet set)
 
     uint64_t s_cows_cycles = 0;
     uint64_t s_cows_cycles_self = 0;

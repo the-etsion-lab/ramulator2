@@ -144,7 +144,7 @@ std::tuple<bool,bool,bool> CoWsCache::LRU_nohit::llc_miss(CacheSet_t& set, Line*
     return {miss, need_evict, miss_not_handled};
 }
 
-std::tuple<bool,bool,bool> CoWsCache::LRU_nohit::llc_evict(CacheSet_t& set, Line* page, uint32_t block_idx) const
+std::tuple<bool,bool,bool> CoWsCache::LRU_nohit::llc_evict(CacheSet_t& set, Line* page, uint32_t block_idx, bool is_write) const
 {
     auto tag = page->getTag();
     bool miss = false;
@@ -163,6 +163,14 @@ std::tuple<bool,bool,bool> CoWsCache::LRU_nohit::llc_evict(CacheSet_t& set, Line
             // no victim available (e.g., all lines are pending). Cannot handle the miss.
             miss_not_handled = true;
         }
+    }
+
+    // WI-004 D2: a dirty LLC writeback is the moment the block reaches the (new) page in DRAM: set its bit.
+    // Done even if the entry could not be installed (C1): the entry is fetched and updated in the table anyway.
+    if(is_write && !page->getBlockID(block_idx)) {
+        page->setBlockID(block_idx, true);
+        page->setDirty(true);
+        m_cows_cache->s_bits_set++;
     }
 
     return {miss, need_evict, miss_not_handled};
@@ -377,7 +385,12 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_miss(Addr_t baddr, bool is_write
     //
     auto& set = m_cache_sets[set_idx];
 
-    auto [cows_cache_miss, cows_cache_evicted, miss_not_handled] = m_policy->llc_miss(set, page, block_idx, is_write);
+    // WI-004 D2: an LLC write miss is a write-allocate *fill* (a read of the block); the bit is set only when the dirty
+    // line is written back (llc_evict). is_write is used for stats only.
+    auto [cows_cache_miss, cows_cache_evicted, miss_not_handled] = m_policy->llc_miss(set, page, block_idx, false);
+    if(is_write && !miss_not_handled) {
+        s_lookups_write_alloc++;
+    }
     if(miss_not_handled) {
         s_miss_not_handled++;
         s_miss_not_handled_on_llc_miss++;
@@ -454,12 +467,15 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_evict(Addr_t baddr, bool evict_d
 
     auto& set = m_cache_sets[set_idx];   // WI-004 D1: the real set, not a copy
 
-    auto [cows_cache_miss, cows_cache_evicted, miss_not_handled] = m_policy->llc_evict(set, page, block_idx);
+    auto [cows_cache_miss, cows_cache_evicted, miss_not_handled] = m_policy->llc_evict(set, page, block_idx, evict_dirty);
     if(miss_not_handled) {
         s_miss_not_handled++;
         s_miss_not_handled_on_llc_evict++;
-        // the miss cannot be handled (e.g., all lines in the set are pending). For simplicity we treat it as a miss and retry later.
-        return {true, latency, true}; // treat it as a miss, but return the latency of just accessing the cows cache. The caller should retry this access later.
+        // WI-004 C1: a writeback cannot be retried (the LLC victim is gone). The entry is fetched from the table and
+        // updated there without being installed (bit/dirty already set by the policy): charge the table latency.
+        latency += get_dram_latency_on_translation(page_num);
+        s_cows_cycles += latency;
+        return {true, latency, true};
     }
     if(m_always_miss) {
         cows_cache_miss = true;
