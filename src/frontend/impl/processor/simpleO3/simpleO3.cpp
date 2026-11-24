@@ -128,6 +128,10 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
       register_stat(m_llc->s_llc_write_misses).name("llc_write_misses");
       register_stat(m_llc->s_llc_mshr_unavailable).name("llc_mshr_unavailable");
       register_stat(m_llc->s_llc_total_cows_latency).name("llc_total_cows_latency");
+      register_stat(m_llc->s_llc_mshr_allocs).name("llc_mshr_allocs");
+      register_stat(m_llc->s_llc_mshr_merges).name("llc_mshr_merges");
+      register_stat(m_llc->s_llc_retry_no_line).name("llc_retry_no_line");
+      register_stat(m_llc->s_llc_retry_cows_not_handled).name("llc_retry_cows_not_handled");
 
       static auto tot_llc_accesses = ADDi(m_llc->s_llc_read_access, m_llc->s_llc_write_access);
       static auto tot_llc_misses = ADDi(m_llc->s_llc_read_misses, m_llc->s_llc_write_misses);

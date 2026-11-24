@@ -145,17 +145,13 @@ bool SimpleO3LLC::send(Request req) {
       return false;
     }
 
-    // count LLC miss
-    if (req.type_id == Request::Type::Read) {
-      s_llc_read_misses++;
-    } else if (req.type_id == Request::Type::Write) {
-      s_llc_write_misses++;
-    }
-
     // MSHR hit processing: add the request to the MSHR entry and return
     if (mshr_it != m_mshrs.end()) {
       DEBUG_LOG(DSIMPLEO3LLC, m_logger,  "MSHR Hit.", m_clk);
-//      printf("LLC: MSHR Hit. (mshr.size=%lu, mshr_it.size=%lu). clk=%lu\n", m_mshrs.size(), m_receive_requests[mshr_it->first].size()+1, m_clk);
+
+      // count LLC miss (secondary miss, merged into an MSHR)
+      count_llc_miss(req);
+      s_llc_mshr_merges++;
 
       req.cache_status = Request::CacheStatus::HalfMiss;
 
@@ -166,32 +162,8 @@ bool SimpleO3LLC::send(Request req) {
       return true;
     }
 
-    // check cows_cache before we allocate a new line, since line allocation in cows_cache can also fail
-    // Yoav: is the dram page translation available in the cows cache?
-    uint32_t cows_latency = 0;
-    bool cows_miss = false;
-    if(m_cows_cache != nullptr) {
-      bool cows_miss_not_handled = false;
-      // WI-004 D2: pass the original request type (req was converted Write->Read above); used for stats only
-      std::tie(cows_miss, cows_latency, cows_miss_not_handled) = m_cows_cache->llc_miss(req.addr, dirty, m_clk, total_misses());
-      if(cows_miss_not_handled) {
-        // cannot allocate line in cows cache (e.g., all lines in the set are pending). For simplicity we treat it as a miss and retry later.
-        return false;
-      }
-
-#if 0
-      printf("cows_miss[clk=%lu]: total_misses=%d, cows_misses=%lu [h=%lu, m=%lu, e=%lu] (addr=0x%lx, is_write=%d, llc_lat=%u, cows_lat=%u)\n",
-              m_clk,
-              total_misses(), m_cows_cache->s_misses,
-              m_cows_cache->s_misses_on_llc_hit, m_cows_cache->s_misses_on_llc_miss, m_cows_cache->s_misses_on_llc_evict,
-              req.addr, (int)(req.type_id == Request::Type::Write),
-              m_latency, cows_latency);
-#endif
-
-      s_llc_total_cows_latency += cows_latency;
-    }
-
-    // Check if there is available cache line in the set
+    // WI-004 D7: check for an available LLC line *before* consulting the CoWs cache, so a request that must be retried
+    // (no ready line in the set) has not mutated CoWs state or been counted.
     bool line_available = false;
     if (set.size() < m_associativity) {
       line_available = true;
@@ -204,9 +176,31 @@ bool SimpleO3LLC::send(Request req) {
     }
     if (!line_available) {
       DEBUG_LOG(DSIMPLEO3LLC, m_logger,  "No cache line available in the set.", m_clk);
-//      printf("LLC: No cache line available in the set. clk=%lu\n", m_clk);
+      s_llc_retry_no_line++;
       return false;
     }
+
+    // check cows_cache before we allocate a new line, since line allocation in cows_cache can also fail
+    // Yoav: is the dram page translation available in the cows cache?
+    uint32_t cows_latency = 0;
+    bool cows_miss = false;
+    if(m_cows_cache != nullptr) {
+      bool cows_miss_not_handled = false;
+      // WI-004 D2: pass the original request type (req was converted Write->Read above); used for stats only
+      std::tie(cows_miss, cows_latency, cows_miss_not_handled) = m_cows_cache->llc_miss(req.addr, dirty, m_clk, total_misses());
+      if(cows_miss_not_handled) {
+        // cannot allocate line in cows cache (e.g., all lines in the set are pending). The core retries later;
+        // WI-004 D6: the LLC miss is counted only when the request is accepted.
+        s_llc_retry_cows_not_handled++;
+        return false;
+      }
+
+      s_llc_total_cows_latency += cows_latency;
+    }
+
+    // WI-004 D6: count the (primary) LLC miss once, now that the request is accepted
+    count_llc_miss(req);
+    s_llc_mshr_allocs++;
 
     // Allocate a new cache line
     auto newline_it = allocate_line(set, req.addr);

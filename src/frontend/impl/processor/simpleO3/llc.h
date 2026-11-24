@@ -72,6 +72,12 @@ class SimpleO3LLC : public Clocked<SimpleO3LLC> {
     int s_llc_eviction = 0;
     int s_llc_mshr_unavailable = 0;
     int s_llc_total_cows_latency = 0;
+    // WI-004 D6/D7: an LLC miss is counted once, when the request is accepted (MSHR merge or MSHR allocation);
+    // requests rejected for retry are counted separately (old llc_*_misses = new + retries, with CoWs off)
+    uint64_t s_llc_mshr_allocs = 0;
+    uint64_t s_llc_mshr_merges = 0;
+    uint64_t s_llc_retry_no_line = 0;
+    uint64_t s_llc_retry_cows_not_handled = 0;
 
     std::string m_stats_name = "llc";
     bool m_dump_raw_latency = true;   // WI-005 (D-28): write the raw per-request latency files (GBs at 1G)
@@ -103,6 +109,14 @@ class SimpleO3LLC : public Clocked<SimpleO3LLC> {
 
     int total_misses() {
       return s_llc_read_misses + s_llc_write_misses;
+    }
+
+    void count_llc_miss(const Request& req) {
+      if (req.type_id == Request::Type::Read) {
+        s_llc_read_misses++;
+      } else if (req.type_id == Request::Type::Write) {
+        s_llc_write_misses++;
+      }
     }
 
     // called when simulation finished to dump stats
