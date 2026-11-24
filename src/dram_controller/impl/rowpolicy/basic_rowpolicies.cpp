@@ -42,6 +42,12 @@ class ClosedRowPolicy : public IRowPolicy, public Implementation {
 
     int s_num_close_reqs = 0;
 
+    // WI-005 (Q-02): close the row with the auto-precharge variant of the cap-th access instead of a priority PRE
+    bool m_auto_precharge = false;
+    int m_cmd_RD = -1, m_cmd_WR = -1, m_cmd_RDA = -1, m_cmd_WRA = -1;
+    int s_num_close_autoprecharge = 0;  // cap-th access converted to RDA/WRA
+    int s_num_close_fallback = 0;       // could not convert (RDA/WRA not ready, or another active request uses the bank)
+
     std::vector<uint64_t> m_col_accesses;
 
   public:
@@ -67,6 +73,19 @@ class ClosedRowPolicy : public IRowPolicy, public Implementation {
       m_col_accesses.resize(m_num_banks * m_num_bankgroups * m_num_ranks, 0);
 
       register_stat(s_num_close_reqs).name("num_close_reqs");
+
+      m_auto_precharge = param<bool>("auto_precharge")
+        .desc("Close the row with RDA/WRA on the cap-th access instead of a priority PRE.").default_val(false);
+      if (m_auto_precharge) {
+        for (auto c : {"RD", "WR", "RDA", "WRA"}) {
+          if (!m_dram->m_commands.contains(c))
+            throw ConfigurationError("ClosedRowPolicy auto_precharge requires DRAM command {}!", c);
+        }
+        m_cmd_RD = m_dram->m_commands("RD");   m_cmd_WR = m_dram->m_commands("WR");
+        m_cmd_RDA = m_dram->m_commands("RDA"); m_cmd_WRA = m_dram->m_commands("WRA");
+        register_stat(s_num_close_autoprecharge).name("num_close_autoprecharge");
+        register_stat(s_num_close_fallback).name("num_close_fallback");
+      }
     };
 
     void update(bool request_found, ReqBuffer::iterator& req_it) override {
@@ -108,6 +127,20 @@ class ClosedRowPolicy : public IRowPolicy, public Implementation {
         
         m_col_accesses[flat_bank_id]++;
 
+        if (m_col_accesses[flat_bank_id] >= m_cap && m_auto_precharge &&
+            (req_it->command == m_cmd_RD || req_it->command == m_cmd_WR)) {
+          int ap_cmd = (req_it->command == m_cmd_RD) ? m_cmd_RDA : m_cmd_WRA;
+          if (m_dram->check_ready(ap_cmd, req_it->addr_vec) && !m_ctrl->other_active_request_in_bank(req_it)) {
+            // issue this access as RDA/WRA: the bank closes with it, no priority PRE
+            req_it->command = ap_cmd;
+            req_it->final_command = ap_cmd;
+            m_col_accesses[flat_bank_id] = 0;
+            s_num_close_reqs++;
+            s_num_close_autoprecharge++;
+            return;
+          }
+          s_num_close_fallback++;
+        }
         if (m_col_accesses[flat_bank_id] >= m_cap) {
           Request req(req_it->addr_vec, m_PRE_req_id);
           m_ctrl->priority_send(req);
