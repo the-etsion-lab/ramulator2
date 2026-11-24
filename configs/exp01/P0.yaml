@@ -49,7 +49,9 @@ MemorySystem:
     timing:
       preset: DDR5_8000C
     voltage:
+      preset: Default   # WI-005: without a preset DRAMPower uses V=I=-1 (results/WI-005/F-energy-presets.md)
     current:
+      preset: Default
     RFM:
       BRC: 2
 
