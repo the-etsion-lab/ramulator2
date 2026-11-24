@@ -52,6 +52,10 @@ class DDR5COW : public IDRAM, public Implementation {
     inline static const std::map<std::string, std::vector<double>> current_presets = {
       // name           IDD0  IDD2N   IDD3N   IDD4R   IDD4W   IDD5B   IPP0  IPP2N  IPP3N  IPP4R  IPP4W  IPP5B
       {"Default",       {60,   50,     55,     145,    145,    362,     3,    3,     3,     3,     3,     48}},
+      // WI-008: Micron 16Gb DDR5 Die Rev D x8 (MT60B2G8) addendum, Table 8, DDR5-6400 column (lit/DDR5-IDD.md).
+      // No DDR5-8000 or 32/64Gb IDD tables are published; IDD5B is kept and density scales through nRFC1.
+      {"Micron16Gb_RevD_x8_6400", {53, 49,     92,     238,    265,    377,     9,    7,     8,     10,    23,    33}},
+      {"Micron16Gb_RevD_x8_5600", {53, 49,     91,     218,    241,    377,     9,    7,     8,     10,    23,    33}},
     };
   /************************************************
    *                Organization
@@ -201,6 +205,7 @@ class DDR5COW : public IDRAM, public Implementation {
 
     // WI-005: number of issued commands per command type (all channels; resettable at warmup)
     std::vector<size_t> s_num_cmds;
+    std::vector<int64_t> m_energy_params;   // WI-008
 
   /************************************************
    *                 RFM Related
@@ -796,6 +801,16 @@ class DDR5COW : public IDRAM, public Implementation {
       register_stat(s_total_energy).name("total_energy");
       register_stat(s_total_rfm_energy).name("total_rfm_energy");
       register_stat(s_total_refresh_energy).name("total_refresh_energy");
+
+      // WI-008: constants used by the energy formulas, for offline recomputation (results/common/energy.py).
+      // Energies above are per DRAM device; a rank has energy_devices_per_rank devices.
+      m_energy_params = {m_timing_vals("tCK_ps"), m_timing_vals("nRAS"), m_timing_vals("nRP"), m_timing_vals("nBL"),
+                         m_timing_vals("nRFC1"), m_timing_vals("nRFMsb"), (int64_t)m_organization.count[m_levels["bankgroup"]],
+                         (int64_t)(m_channel_width / m_organization.dq)};
+      const char* names[] = {"tCK_ps", "nRAS", "nRP", "nBL", "nRFC1", "nRFMsb", "num_bankgroups", "devices_per_rank"};
+      for (size_t i = 0; i < m_energy_params.size(); i++) {
+        register_stat(m_energy_params[i], false).name("energy_param_{}", names[i]);
+      }
 
 
       for (auto& power_stat : m_power_stats){
