@@ -616,6 +616,10 @@ class DDR5COW : public IDRAM, public Implementation {
 
           /*** Bank ***/
           {.level = "bank", .preceding = {"ACT"}, .following = {"ACT", "REFsb", "RFMsb", "DRFMsb"}, .latency = V("nRC")},
+          // WI-005: the implicit precharge of RDA/WRA cannot start before tRAS expires, so the next ACT to the bank is at least
+          // nRAS + nRP after the previous ACT. Redundant on the explicit-PRE path (ACT->PRE >= nRAS, PRE->ACT >= nRP), but needed
+          // for RDA because the presets have nRC < nRAS + nRP (e.g. DDR5_8000C: 184 < 128 + 70).
+          {.level = "bank", .preceding = {"ACT"}, .following = {"ACT"}, .latency = V("nRAS") + V("nRP")},
           {.level = "bank", .preceding = {"ACT"}, .following = {"RD", "RDA", "WR", "WRA"}, .latency = V("nRCD")},
           {.level = "bank", .preceding = {"ACT"}, .following = {"PRE", "PREsb"}, .latency = V("nRAS")},
           {.level = "bank", .preceding = {"PRE", "PREsb"}, .following = {"ACT", "REFsb", "RFMsb", "DRFMsb"}, .latency = V("nRP")},
@@ -681,6 +685,9 @@ class DDR5COW : public IDRAM, public Implementation {
       // Bank Preqs
       m_preqs[m_levels["bank"]][m_commands["RD"]] = Lambdas::Preq::Bank::RequireRowOpen<DDR5COW>;
       m_preqs[m_levels["bank"]][m_commands["WR"]] = Lambdas::Preq::Bank::RequireRowOpen<DDR5COW>;
+      // WI-005: auto-precharge column commands need the row open like RD/WR (ACT if closed, PRE if another row is open)
+      m_preqs[m_levels["bank"]][m_commands["RDA"]] = Lambdas::Preq::Bank::RequireRowOpen<DDR5COW>;
+      m_preqs[m_levels["bank"]][m_commands["WRA"]] = Lambdas::Preq::Bank::RequireRowOpen<DDR5COW>;
       m_preqs[m_levels["bank"]][m_commands["ACT"]] = Lambdas::Preq::Bank::RequireRowOpen<DDR5COW>;
       m_preqs[m_levels["bank"]][m_commands["PRE"]] = Lambdas::Preq::Bank::RequireBankClosed<DDR5COW>;
     };
@@ -690,6 +697,8 @@ class DDR5COW : public IDRAM, public Implementation {
 
       m_rowhits[m_levels["bank"]][m_commands["RD"]] = Lambdas::RowHit::Bank::RDWR<DDR5COW>;
       m_rowhits[m_levels["bank"]][m_commands["WR"]] = Lambdas::RowHit::Bank::RDWR<DDR5COW>;
+      m_rowhits[m_levels["bank"]][m_commands["RDA"]] = Lambdas::RowHit::Bank::RDWR<DDR5COW>;
+      m_rowhits[m_levels["bank"]][m_commands["WRA"]] = Lambdas::RowHit::Bank::RDWR<DDR5COW>;
     }
 
 
@@ -698,6 +707,8 @@ class DDR5COW : public IDRAM, public Implementation {
 
       m_rowopens[m_levels["bank"]][m_commands["RD"]] = Lambdas::RowOpen::Bank::RDWR<DDR5COW>;
       m_rowopens[m_levels["bank"]][m_commands["WR"]] = Lambdas::RowOpen::Bank::RDWR<DDR5COW>;
+      m_rowopens[m_levels["bank"]][m_commands["RDA"]] = Lambdas::RowOpen::Bank::RDWR<DDR5COW>;
+      m_rowopens[m_levels["bank"]][m_commands["WRA"]] = Lambdas::RowOpen::Bank::RDWR<DDR5COW>;
     }
 
     void set_powers() {
@@ -745,6 +756,15 @@ class DDR5COW : public IDRAM, public Implementation {
       m_powers[m_levels["bank"]][m_commands["PRE"]] = Lambdas::Power::Bank::PRE<DDR5COW>;
       m_powers[m_levels["bank"]][m_commands["RD"]]  = Lambdas::Power::Bank::RD<DDR5COW>;
       m_powers[m_levels["bank"]][m_commands["WR"]]  = Lambdas::Power::Bank::WR<DDR5COW>;
+      // WI-005: RDA/WRA = column access + implicit precharge (counted as RD/WR + PRE)
+      m_powers[m_levels["bank"]][m_commands["RDA"]] = [](Node* node, int cmd, const AddrVec_t& addr_vec, Clk_t clk) {
+        Lambdas::Power::Bank::RD<DDR5COW>(node, cmd, addr_vec, clk);
+        Lambdas::Power::Bank::PRE<DDR5COW>(node, cmd, addr_vec, clk);
+      };
+      m_powers[m_levels["bank"]][m_commands["WRA"]] = [](Node* node, int cmd, const AddrVec_t& addr_vec, Clk_t clk) {
+        Lambdas::Power::Bank::WR<DDR5COW>(node, cmd, addr_vec, clk);
+        Lambdas::Power::Bank::PRE<DDR5COW>(node, cmd, addr_vec, clk);
+      };
 
       // m_powers[m_levels["rank"]][m_commands["REFsb"]] = Lambdas::Power::Rank::REFsb<DDR5COW>;
       // m_powers[m_levels["rank"]][m_commands["REFsb_end"]] = Lambdas::Power::Rank::REFsb_end<DDR5COW>;
@@ -755,6 +775,11 @@ class DDR5COW : public IDRAM, public Implementation {
 
       m_powers[m_levels["rank"]][m_commands["ACT"]] = Lambdas::Power::Rank::ACT<DDR5COW>;
       m_powers[m_levels["rank"]][m_commands["PRE"]] = Lambdas::Power::Rank::PRE<DDR5COW>;
+      // WI-005: rank active->idle bookkeeping for the implicit precharge, taken at RDA/WRA issue (the bank is still Opened
+      // there because update_powers precedes update_states). The rank may go idle up to nRTP (RDA) or nCWL+nBL+nWR (WRA)
+      // cycles early; the background-energy bias is bounded in the EXP-01 summary.
+      m_powers[m_levels["rank"]][m_commands["RDA"]] = Lambdas::Power::Rank::PRE<DDR5COW>;
+      m_powers[m_levels["rank"]][m_commands["WRA"]] = Lambdas::Power::Rank::PRE<DDR5COW>;
       m_powers[m_levels["rank"]][m_commands["PREA"]] = Lambdas::Power::Rank::PREA<DDR5COW>;
       m_powers[m_levels["rank"]][m_commands["REFab"]] = Lambdas::Power::Rank::REFab<DDR5COW>;
       m_powers[m_levels["rank"]][m_commands["REFab_end"]] = Lambdas::Power::Rank::REFab_end<DDR5COW>;
