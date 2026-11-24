@@ -40,6 +40,7 @@ struct Request {
   int command = -1;          // The command that need to be issued to progress the request
   int final_command = -1;    // The final command that is needed to finish the request
   bool is_stat_updated = false; // Memory controller stats
+  int row_class = -1;           // WI-005: row-buffer outcome at the request's first issued command: 0 hit, 1 miss (bank closed), 2 conflict
 
   Clk_t core2llc = -1;   // Clock cycle when the request arrives at LLC
   Clk_t arrive = -1;   // Clock cycle when the request arrive at the memory controller

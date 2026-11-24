@@ -123,6 +123,25 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     void fini() {
       dump_dram_latency_samples();
       dump_total_latency_samples();
+      dump_read_latency_by_rowclass();
+    }
+
+    // WI-005: post-warmup histogram of controller read latency (arrive -> data, DRAM cycles) by row-buffer outcome, so the
+    // non-hit (miss + conflict) mean/p95 can be reported (D-24). Forwarded reads (write-buffer hits) are excluded.
+    std::map<Clk_t, std::array<uint64_t, 3>> m_read_lat_by_class;
+    uint64_t s_read_lat_sum_by_class[3] = {0, 0, 0};
+    uint64_t s_read_cnt_by_class[3] = {0, 0, 0};
+
+    void dump_read_latency_by_rowclass() {
+      auto of = std::ofstream(m_controller_stats_name + "_read_latency_by_rowclass");
+      of << "# post-warmup controller read latency (DRAM cycles) histogram, channel " << m_channel_id << ": latency hit miss conflict\n";
+      for (const auto& [lat, c] : m_read_lat_by_class) {
+        of << lat << " " << c[0] << " " << c[1] << " " << c[2] << "\n";
+      }
+    }
+
+    void on_reset_stats() override {
+      m_read_lat_by_class.clear();   // registered sums/counts are reset by the stats system
     }
 
     void setup(IFrontEnd* frontend, IMemorySystem* memory_system) override {
@@ -178,6 +197,11 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       register_stat(s_priority_queue_len_avg).name("priority_queue_len_avg_{}", m_channel_id);
 
       register_stat(s_read_latency).name("read_latency_{}", m_channel_id);
+      const char* rc_names[3] = {"hit", "miss", "conflict"};
+      for (int k = 0; k < 3; k++) {
+        register_stat(s_read_lat_sum_by_class[k]).name("read_latency_sum_{}_{}", rc_names[k], m_channel_id);
+        register_stat(s_read_cnt_by_class[k]).name("read_count_{}_{}", rc_names[k], m_channel_id);
+      }
       register_stat(s_avg_read_latency).name("avg_read_latency_{}", m_channel_id);
     };
 
@@ -355,16 +379,19 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         if (is_row_hit(req)) {
           s_read_row_hits++;
           s_row_hits++;
+          req->row_class = 0;
           if (req->source_id != -1)
             s_read_row_hits_per_core[req->source_id]++;
         } else if (is_row_open(req)) {
           s_read_row_conflicts++;
           s_row_conflicts++;
+          req->row_class = 2;
           if (req->source_id != -1)
             s_read_row_conflicts_per_core[req->source_id]++;
         } else {
           s_read_row_misses++;
           s_row_misses++;
+          req->row_class = 1;
           if (req->source_id != -1)
             s_read_row_misses_per_core[req->source_id]++;
         }
@@ -409,6 +436,12 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
             m_dram_latency_samples.push_back(std::make_tuple(req.addr, req.depart - req.arrive));
             m_total_latency_samples.push_back(std::make_tuple(req.addr, req.depart - req.core2llc));
             s_read_latency += req.depart - req.arrive;
+            if (req.row_class >= 0) {
+              Clk_t lat = req.depart - req.arrive;
+              m_read_lat_by_class[lat][req.row_class]++;
+              s_read_lat_sum_by_class[req.row_class] += lat;
+              s_read_cnt_by_class[req.row_class]++;
+            }
           }
 
 //          printf("DRAM Controller: request complete. clk=%lu, addr=0x%lx, type=%d, cache_status=%d\n", m_clk, req.addr, req.type_id, req.cache_status);
