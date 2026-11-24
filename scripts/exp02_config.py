@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Write an EXP-02 config (WI-010 item 2): a CoWs-enabled variant of an EXP-01 base config with every CoWs timing knob explicit.
 
-usage: exp02_config.py --name NAME --ratio R --table-lat CYCLES --table-lat-source TEXT --lookup-lat CYCLES
+usage: exp02_config.py --name NAME --ratio R --table-lat CYCLES --table-lat-run RUN-ID --table-lat-stat STAT --lookup-lat CYCLES
                        [--assoc 8] [--carveout lines|ways|none] [--base configs/exp01/P2.yaml] [--allow-zero-table]
 Writes configs/exp02/NAME.yaml (relative to the repo root). __NINSTS__/__TRACES__ stay for results/EXP-01/run.sh.
 Guards (reviewer K5): the base's CoWs settings are replaced, never inherited (exp01 leftovers: cows_enable false, 8KB pages,
-explicit lookup latency 0, table latency 0); the table latency must be given with its source (recorded in the file header and
-in cows_table_latency_source) and must be > 0 unless --allow-zero-table (sensitivity runs); pages are 4KB (one DDR5 row, WI-004 D10).
+explicit table latency 0); both latencies are required arguments (lookup 0 is legitimate: parallel lookup, D-23); the table
+latency's provenance (run-id, statistic, value; D-24: mean or p95 of NON-hit DRAM reads on the P2 [+ H-D] base) is recorded in the
+file header and in cows_table_latency_source; table latency must be > 0 unless --allow-zero-table; pages are 4KB (WI-004 D10).
 """
 import argparse, os, re, sys
 
@@ -19,12 +20,14 @@ def main():
     a.add_argument("--ratio", type=int, required=True)
     a.add_argument("--assoc", type=int, default=8)
     a.add_argument("--table-lat", type=int, required=True)
-    a.add_argument("--table-lat-source", required=True)
+    a.add_argument("--table-lat-run", required=True, help="results run-id the latency was measured in")
+    a.add_argument("--table-lat-stat", required=True, help="e.g. nonhit_mean, nonhit_p95 (D-24)")
     a.add_argument("--lookup-lat", type=int, required=True)
     a.add_argument("--carveout", choices=["lines", "ways", "none"], default="lines")
     a.add_argument("--base", default="configs/exp01/P2.yaml")
     a.add_argument("--allow-zero-table", action="store_true")
     o = a.parse_args()
+    o.table_lat_source = f"run {o.table_lat_run}, {o.table_lat_stat} = {o.table_lat} cyc"
     if o.table_lat <= 0 and not o.allow_zero_table:
         sys.exit("table latency must be > 0 (use --allow-zero-table for a sensitivity run)")
     if o.lookup_lat < 0 or o.ratio <= 0 or o.assoc <= 0:
