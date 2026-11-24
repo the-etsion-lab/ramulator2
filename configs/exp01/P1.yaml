@@ -7,6 +7,7 @@ Frontend:
   num_expected_insts: __NINSTS__
   latency_factor: 1
   warmup_percent: 25
+  dump_raw_latency_samples: false   # D-28: raw per-request latency files are GBs; -cdf files are kept
   traces:
     __TRACES__
 
@@ -58,6 +59,7 @@ MemorySystem:
   Controller:
     impl: Generic
     controller_stats_name_prefix: controller_stats
+    dump_raw_latency_samples: false   # D-28
     auto_precharge: true
     Scheduler:
       impl: FRFCFS
