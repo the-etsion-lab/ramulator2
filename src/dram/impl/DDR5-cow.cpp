@@ -207,6 +207,14 @@ class DDR5COW : public IDRAM, public Implementation {
     std::vector<size_t> s_num_cmds;
     std::vector<int64_t> m_energy_params;   // WI-008
 
+    // WI-008: bank-wise background (DRAMPower-5 style) needs the number of open banks over time, per rank.
+    // s_open_bank_cycles[r] = sum over cycles of #open banks in rank r (post-warmup), including the implicit-precharge
+    // tail of RDA/WRA (the bank stays open until max(issue + nRTP | nCWL+nBL+nWR, ACT + nRAS)).
+    std::vector<uint64_t> s_open_bank_cycles;
+    std::vector<int> m_ob_cur;          // current #open banks per rank
+    std::vector<Clk_t> m_ob_last;       // clk of the last open-bank-count change per rank
+    std::vector<Clk_t> m_act_clk;       // clk of the last ACT per flat bank
+
   /************************************************
    *                 RFM Related
    ***********************************************/
@@ -255,6 +263,9 @@ class DDR5COW : public IDRAM, public Implementation {
      * the post-warmup window. A rank that is refreshing keeps its state; REF*_end restarts its idle interval.
      */
     void on_reset_stats() override {
+      for (size_t r = 0; r < m_ob_last.size(); r++) {
+        m_ob_last[r] = m_clk;   // WI-008: open-bank cycles restart at the warmup reset
+      }
       for (auto& ps : m_power_stats) {
         if (ps.cur_power_state == PowerStats::PowerState::ACTIVE) {
           ps.active_start_cycle = m_clk;
@@ -270,10 +281,50 @@ class DDR5COW : public IDRAM, public Implementation {
       m_channels[channel_id]->update_timing(command, addr_vec, m_clk);
       m_channels[channel_id]->update_powers(command, addr_vec, m_clk);
       m_channels[channel_id]->update_states(command, addr_vec, m_clk);
+      if (m_drampower_enable) {
+        track_open_banks(command, addr_vec);
+      }
 
       // Check if the command requires future action
       check_future_action(command, addr_vec);
     };
+
+    // WI-008: open-bank-cycles bookkeeping (called after update_states, so the bank states are the new ones)
+    void track_open_banks(int command, const AddrVec_t& addr_vec) {
+      const auto& meta = m_command_meta[command];
+      if (!(meta.is_opening || meta.is_closing)) {
+        return;
+      }
+      int num_ranks = m_organization.count[m_levels["rank"]];
+      int num_bgs = m_organization.count[m_levels["bankgroup"]];
+      int num_banks = m_organization.count[m_levels["bank"]];
+      int ch = addr_vec[m_levels["channel"]], rk = addr_vec[m_levels["rank"]];
+      int r = ch * num_ranks + rk;
+      s_open_bank_cycles[r] += (uint64_t)m_ob_cur[r] * (m_clk - m_ob_last[r]);
+      m_ob_last[r] = m_clk;
+      m_ob_cur[r] = Lambdas::Power::Rank::get_open_bank_count<DDR5COW>(m_channels[ch]->m_child_nodes[rk]);
+
+      int bg = addr_vec[m_levels["bankgroup"]], ba = addr_vec[m_levels["bank"]];
+      if (bg < 0 || ba < 0) {
+        return;   // rank-level command
+      }
+      int fb = ((r * num_bgs) + bg) * num_banks + ba;
+      if (command == m_commands("ACT")) {
+        m_act_clk[fb] = m_clk;
+      } else if (command == m_commands("RDA") || command == m_commands("WRA")) {
+        Clk_t tail = (command == m_commands("RDA")) ? m_timing_vals("nRTP")
+                                                    : m_timing_vals("nCWL") + m_timing_vals("nBL") + m_timing_vals("nWR");
+        tail = std::max<Clk_t>(tail, m_act_clk[fb] + m_timing_vals("nRAS") - m_clk);
+        s_open_bank_cycles[r] += tail;
+      }
+    }
+
+    void close_open_bank_intervals() {
+      for (size_t r = 0; r < m_ob_cur.size(); r++) {
+        s_open_bank_cycles[r] += (uint64_t)m_ob_cur[r] * (m_clk - m_ob_last[r]);
+        m_ob_last[r] = m_clk;
+      }
+    }
 
     void check_future_action(int command, const AddrVec_t& addr_vec) {
       //#define DBG_CMD(cmd, t) printf("YOAV: Issue command %s every %lu ps (m_clk=%lu)\n", cmd, (uint64_t)t, (uint64_t)m_clk);
@@ -807,11 +858,23 @@ class DDR5COW : public IDRAM, public Implementation {
       m_energy_params = {m_timing_vals("tCK_ps"), m_timing_vals("nRAS"), m_timing_vals("nRP"), m_timing_vals("nBL"),
                          m_timing_vals("nRFC1"), m_timing_vals("nRFMsb"), (int64_t)m_organization.count[m_levels["bankgroup"]],
                          (int64_t)(m_channel_width / m_organization.dq)};
-      const char* names[] = {"tCK_ps", "nRAS", "nRP", "nBL", "nRFC1", "nRFMsb", "num_bankgroups", "devices_per_rank"};
+      m_energy_params.push_back(m_timing_vals("nRC"));
+      m_energy_params.push_back((int64_t)m_organization.count[m_levels["bankgroup"]] * m_organization.count[m_levels["bank"]]);
+      const char* names[] = {"tCK_ps", "nRAS", "nRP", "nBL", "nRFC1", "nRFMsb", "num_bankgroups", "devices_per_rank",
+                             "nRC", "banks_per_rank"};
       for (size_t i = 0; i < m_energy_params.size(); i++) {
         register_stat(m_energy_params[i], false).name("energy_param_{}", names[i]);
       }
 
+
+      // WI-008: open-bank bookkeeping
+      s_open_bank_cycles.resize(m_power_stats.size(), 0);
+      m_ob_cur.resize(m_power_stats.size(), 0);
+      m_ob_last.resize(m_power_stats.size(), 0);
+      m_act_clk.resize(m_power_stats.size() * m_organization.count[m_levels["bankgroup"]] * m_organization.count[m_levels["bank"]], 0);
+      for (size_t r = 0; r < s_open_bank_cycles.size(); r++) {
+        register_stat(s_open_bank_cycles[r]).name("open_bank_cycles_rank{}", r);
+      }
 
       for (auto& power_stat : m_power_stats){
         register_stat(power_stat.total_background_energy).name("total_background_energy_rank{}", power_stat.rank_id);
@@ -841,6 +904,7 @@ class DDR5COW : public IDRAM, public Implementation {
     void finalize() override {
       if (!m_drampower_enable)
         return;
+      close_open_bank_intervals();   // WI-008
 
       int num_channels = m_organization.count[m_levels["channel"]];
       int num_ranks = m_organization.count[m_levels["rank"]];
