@@ -10,6 +10,15 @@ m_latency(latency), m_cows_cache(cows_cache), m_size_bytes(size_bytes), m_linesi
   m_logger = Logging::create_logger("SimpleO3LLC");
 
   m_set_size = m_size_bytes / (m_linesize_bytes * m_associativity);
+  // WI-005: the index is taken with a mask (sets-1), so the set count must be a power of two and the capacity exact;
+  // e.g. 2MB/core with associativity 7 would silently use a garbage mask. For 7 ways use 1792KB/core.
+  if (m_set_size <= 0 || (m_set_size & (m_set_size - 1)) != 0 ||
+      (int64_t)m_set_size * m_linesize_bytes * m_associativity != m_size_bytes) {
+    throw std::runtime_error(fmt::format("SimpleO3LLC: {} bytes / ({}B x {} ways) = {} sets is not an exact power of two",
+                                         m_size_bytes, m_linesize_bytes, m_associativity,
+                                         (double)m_size_bytes / (m_linesize_bytes * m_associativity)));
+  }
+  std::cerr << "# SimpleO3LLC: bytes=" << m_size_bytes << " sets=" << m_set_size << " ways=" << m_associativity << std::endl;
   m_index_mask = m_set_size - 1;
   m_index_offset = calc_log2(m_linesize_bytes);
   m_tag_offset = calc_log2(m_set_size) + m_index_offset;
