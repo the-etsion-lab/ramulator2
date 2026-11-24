@@ -51,7 +51,7 @@ MemorySystem:
     voltage:
       preset: Default   # WI-005: without a preset DRAMPower uses V=I=-1 (results/WI-005/F-energy-presets.md)
     current:
-      preset: Default
+      preset: Micron16Gb_RevD_x8_6400   # WI-008: Micron 16Gb Rev D x8 DDR5-6400 IDDs (lit/DDR5-IDD.md); energy via results/common/energy.py (bank-wise)
     RFM:
       BRC: 2
 
