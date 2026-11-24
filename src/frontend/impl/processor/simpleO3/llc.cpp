@@ -422,7 +422,8 @@ void SimpleO3LLC::dump_llc() {
 
 void SimpleO3LLC::dump_dram_read_latency_samples()
 {
-  auto of = std::ofstream(m_stats_name + ".dram-read-latency");
+  std::ofstream of;  // WI-005 (D-28): raw per-request samples only if m_dump_raw_latency; the -cdf files are always written
+  if (m_dump_raw_latency) of.open(m_stats_name + ".dram-read-latency");
   std::map<Clk_t, size_t> latency_histogram;
 
   of << "# Total dram read latency [addr\t\t\tlatency]" << std::endl;
@@ -456,7 +457,8 @@ void SimpleO3LLC::dump_dram_read_latency_samples()
 
 void SimpleO3LLC::dump_total_read_latency_samples()
 {
-  auto of = std::ofstream(m_stats_name + ".total-read-latency");
+  std::ofstream of;  // WI-005 (D-28): raw per-request samples only if m_dump_raw_latency; the -cdf files are always written
+  if (m_dump_raw_latency) of.open(m_stats_name + ".total-read-latency");
   std::map<Clk_t, size_t> latency_histogram;
 
   of << "# Total read latency [addr\t\t\tlatency]" << std::endl;
@@ -491,7 +493,8 @@ void SimpleO3LLC::dump_total_read_latency_samples()
 void SimpleO3LLC::dump_total_read_miss_latency_samples()
 {
   std::map<Clk_t, size_t> latency_histogram;
-  auto of = std::ofstream(m_stats_name + ".total-read-miss-latency");
+  std::ofstream of;  // WI-005 (D-28): raw per-request samples only if m_dump_raw_latency; the -cdf files are always written
+  if (m_dump_raw_latency) of.open(m_stats_name + ".total-read-miss-latency");
 
   of<<"# Total read miss latency [addr, latency, miss type (M=Miss, CM=CoWs Miss, HM=HalfMiss)]"<<std::endl;
   for(auto it : s_stats_read_miss_latencies) {

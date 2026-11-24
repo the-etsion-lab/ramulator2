@@ -74,6 +74,7 @@ class SimpleO3LLC : public Clocked<SimpleO3LLC> {
     int s_llc_total_cows_latency = 0;
 
     std::string m_stats_name = "llc";
+    bool m_dump_raw_latency = true;   // WI-005 (D-28): write the raw per-request latency files (GBs at 1G)
     std::vector<std::tuple<Addr_t, Clk_t>> s_stats_dram_latency; // dram read latency for all requests that miss in the LLC (addr, latency) pairs
     std::vector<std::tuple<Addr_t, Clk_t>> s_stats_read_latencies; // total read latency for all requests
     std::vector<std::tuple<Addr_t, Clk_t, int>> s_stats_read_miss_latencies; // total read latency for read misses

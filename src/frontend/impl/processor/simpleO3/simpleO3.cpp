@@ -102,7 +102,10 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
       }
 
       // Create the LLC
+      bool dump_raw_latency = param<bool>("dump_raw_latency_samples")
+        .desc("Write raw per-request latency files (llc.*-latency); the -cdf summaries are always written.").default_val(true);
       m_llc = new SimpleO3LLC(llc_latency, llc_capacity_per_core * m_num_cores, llc_linesize_bytes, llc_associativity, llc_num_mshr_per_core * m_num_cores, m_cows_cache);
+      m_llc->m_dump_raw_latency = dump_raw_latency;
       // m_llc->deserialize(serialization_filename);
       // m_llc->serialize(serialization_filename);
 

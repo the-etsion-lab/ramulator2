@@ -107,6 +107,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       auto str = param<std::string>("controller_stats_name_prefix").desc("Prefix for the DRAM controller related stats names.").default_val("");
       m_controller_stats_name = str;
       m_controller_stats_name += "_";
+      m_dump_raw_latency = param<bool>("dump_raw_latency_samples")
+        .desc("Write the raw per-request latency sample files (large).").default_val(true);
 
       m_scheduler = create_child_ifce<IScheduler>();
       m_refresh = create_child_ifce<IRefreshManager>();
@@ -120,9 +122,13 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       }
     };
 
+    bool m_dump_raw_latency = true;   // WI-005 (D-28)
+
     void fini() {
-      dump_dram_latency_samples();
-      dump_total_latency_samples();
+      if (m_dump_raw_latency) {
+        dump_dram_latency_samples();
+        dump_total_latency_samples();
+      }
       dump_read_latency_by_rowclass();
     }
 
