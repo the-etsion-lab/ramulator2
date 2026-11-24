@@ -20,6 +20,8 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
     uint64_t m_cows_page_bytes = 0;            // WI-004 D10
     bool m_cows_check_page_geometry = true;    // WI-004 D10
     bool m_cows_geometry_checked = false;      // WI-004 D10
+    std::string m_cows_carveout = "none";      // WI-010
+    int m_llc_linesize_bytes = 64;             // WI-010
 
     int m_num_cores = -1;
     std::vector<SimpleO3Core*> m_cores;
@@ -47,6 +49,7 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
       // LLC params
       int llc_latency           = param<int>("llc_latency").desc("Aggregated latency of the LLC.").default_val(47);
       int llc_linesize_bytes    = param<int>("llc_linesize").desc("LLC cache line size in bytes.").default_val(64);
+      m_llc_linesize_bytes = llc_linesize_bytes;
       int llc_associativity     = param<int>("llc_associativity").desc("LLC set associativity.").default_val(8);
       int llc_capacity_per_core = parse_capacity_str(param<std::string>("llc_capacity_per_core").desc("LLC capacity per core.").default_val("2MB"));
       int llc_num_mshr_per_core = param<int>("llc_num_mshr_per_core").desc("Number of LLC MSHR entries per core.").default_val(16);
@@ -62,6 +65,11 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
       uint32_t cows_cache_assoc = param<uint32_t>("cows_cache_assoc").desc("Associativity of CoWs cache.").required();
       uint32_t dram_page_bytes = parse_capacity_str(param<std::string>("dram_page_bytes").desc("size of DRAM page.").required());
       m_cows_page_bytes = dram_page_bytes;
+      m_cows_carveout = param<std::string>("cows_carveout")
+        .desc("WI-010: charge the CoWs cache's LLC capacity: none | ways | lines.").default_val("none");
+      if (m_cows_carveout != "none" && m_cows_carveout != "ways" && m_cows_carveout != "lines") {
+        throw ConfigurationError("cows_carveout must be none, ways or lines (got {})", m_cows_carveout);
+      }
       m_cows_check_page_geometry = param<bool>("cows_check_page_geometry")
         .desc("Require a CoWs page to be exactly one DRAM row in one bank (WI-004 D10).").default_val(true);
       uint32_t always_miss = param<bool>("cows_always_miss").desc("Always miss in CoWs cache.").required();
@@ -140,6 +148,8 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
       register_stat(m_llc->s_llc_mshr_unavailable).name("llc_mshr_unavailable");
       register_stat(m_llc->s_llc_total_cows_latency).name("llc_total_cows_latency");
       register_stat(m_llc->s_llc_mshr_allocs).name("llc_mshr_allocs");
+      register_stat(m_llc->s_llc_carveout_lines, false).name("llc_carveout_lines");      // WI-010
+      register_stat(m_llc->s_llc_effective_bytes, false).name("llc_effective_bytes");    // WI-010
       register_stat(m_llc->s_llc_mshr_merges).name("llc_mshr_merges");
       register_stat(m_llc->s_llc_retry_no_line).name("llc_retry_no_line");
       register_stat(m_llc->s_llc_retry_cows_not_handled).name("llc_retry_cows_not_handled");
@@ -232,6 +242,7 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
       if (m_cows_cache != nullptr && !m_cows_geometry_checked) {
         check_cows_page_geometry(m_memory_system);
         m_cows_geometry_checked = true;
+        apply_cows_carveout();
       }
 
       if(m_clk % 1000000 == 0) {
@@ -316,6 +327,36 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
      * the first two must share channel/rank/bankgroup/bank/row, the next page must not. Also sets the source-index width
      * (log2 rows per bank) used for the entry size.
      */
+    /**
+     * WI-010: charge the LLC capacity the CoWs cache occupies (needs the entry size, known after the geometry check).
+     *  lines: an entry cannot straddle LLC lines and a lookup reads one CoWs set, so each CoWs set occupies
+     *         ceil(assoc x entry_bits / 512) LLC lines: carve cows_sets x that many lines (exact up to line granularity).
+     *  ways:  carve ceil(cows_bytes / way_bytes) full ways from every set (spec option; mostly rounding for small caches).
+     */
+    void apply_cows_carveout() {
+      if (m_cows_carveout == "none") {
+        return;
+      }
+      uint64_t entry_bits = m_cows_cache->s_entry_bits;
+      if (entry_bits == 0) {
+        throw ConfigurationError("cows_carveout needs the CoWs entry size (memory system without DRAM/address mapper?)");
+      }
+      uint64_t line_bits = 8ull * m_llc_linesize_bytes;
+      uint64_t lines_per_cows_set = (m_cows_cache->get_assoc() * entry_bits + line_bits - 1) / line_bits;
+      int64_t lines_physical = (int64_t)m_cows_cache->get_num_sets() * lines_per_cows_set;
+      int64_t lines_bytes = (int64_t)((m_cows_cache->s_cache_bytes + m_llc_linesize_bytes - 1) / m_llc_linesize_bytes);
+      int64_t lines = lines_physical;
+      if (m_cows_carveout == "ways") {
+        int64_t way_lines = m_llc->get_num_sets();
+        int64_t ways = (lines_bytes + way_lines - 1) / way_lines;
+        lines = ways * way_lines;
+      }
+      std::cerr << "# CoWs carve-out: cows bytes=" << m_cows_cache->s_cache_bytes << ", exact lines=" << lines_bytes
+                << ", physical lines (" << m_cows_cache->get_num_sets() << " sets x " << lines_per_cows_set << ")=" << lines_physical
+                << ", mode " << m_cows_carveout << " -> carve " << lines << " lines" << std::endl;
+      m_llc->set_carveout(lines, m_cows_carveout);
+    }
+
     void check_cows_page_geometry(IMemorySystem* memory_system) {
       IDRAM* dram = memory_system->get_dram();
       IAddrMapper* mapper = memory_system->get_addr_mapper();

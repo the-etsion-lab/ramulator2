@@ -28,6 +28,40 @@ m_latency(latency), m_cows_cache(cows_cache), m_size_bytes(size_bytes), m_linesi
   DEBUG_LOG(DSIMPLEO3LLC, m_logger, "Tag offset: {}",    m_tag_offset);
 };
 
+// WI-010: remove `lines` LLC lines (CoWs cache stored in the LLC). Every set loses lines/sets ways; the remaining R = lines mod
+// sets sets lose one more, spread uniformly and deterministically: set i loses the extra way iff floor((i+1)R/S) > floor(iR/S).
+// Must be called before any LLC access (checked).
+void SimpleO3LLC::set_carveout(int64_t lines, const std::string& mode) {
+  bool empty = m_mshrs.empty();
+  for (const auto& [idx, s] : m_cache_sets) {
+    empty = empty && s.empty();
+  }
+  if (!empty) {
+    throw std::runtime_error("SimpleO3LLC::set_carveout: the LLC must be empty when the carve-out is applied");
+  }
+  m_carve_full_ways = (int)(lines / m_set_size);
+  m_carve_rem_sets = lines % m_set_size;
+  m_carve_lines = lines;
+  if (m_carve_full_ways + (m_carve_rem_sets ? 1 : 0) >= m_associativity) {
+    throw std::runtime_error(fmt::format("SimpleO3LLC: carve-out of {} lines leaves no way in some sets ({} ways x {} sets)",
+                                         lines, m_associativity, m_set_size));
+  }
+  s_llc_carveout_lines = lines;
+  s_llc_effective_bytes = (int64_t)m_size_bytes - lines * m_linesize_bytes;
+  std::cerr << "# LLC carve-out (" << mode << "): lines=" << lines << " (" << m_carve_full_ways << " full ways + 1 way in "
+            << m_carve_rem_sets << " of " << m_set_size << " sets), effective LLC bytes=" << s_llc_effective_bytes
+            << " of " << m_size_bytes << std::endl;
+}
+
+int SimpleO3LLC::assoc_of(int set_index) const {
+  if (m_carve_lines == 0) {
+    return m_associativity;
+  }
+  int64_t i = set_index, S = m_set_size, R = m_carve_rem_sets;
+  int extra = ((i + 1) * R / S > i * R / S) ? 1 : 0;
+  return m_associativity - m_carve_full_ways - extra;
+}
+
 void SimpleO3LLC::tick() {
   m_clk++;
 
@@ -165,7 +199,7 @@ bool SimpleO3LLC::send(Request req) {
     // WI-004 D7: check for an available LLC line *before* consulting the CoWs cache, so a request that must be retried
     // (no ready line in the set) has not mutated CoWs state or been counted.
     bool line_available = false;
-    if (set.size() < m_associativity) {
+    if ((int)set.size() < assoc_of(get_index(req.addr))) {   // WI-010: per-set associativity after a carve-out
       line_available = true;
     } else {
       for (const auto& line : set) {
@@ -309,7 +343,7 @@ bool SimpleO3LLC::need_eviction(const CacheSet_t& set, Addr_t addr) {
     return false;
   }
   else {
-    if (set.size() < m_associativity) {
+    if ((int)set.size() < assoc_of(get_index(addr))) {   // WI-010: per-set associativity after a carve-out
       return false;
     } else {
       return true;

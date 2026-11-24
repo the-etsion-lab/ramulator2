@@ -393,6 +393,8 @@ public:
     uint64_t s_entry_bits = 0;
     uint64_t s_cache_bytes = 0;
     void set_source_index_bits(uint32_t src_index_bits);
+    uint32_t get_num_sets() const { return m_nsets; }       // WI-010
+    uint32_t get_assoc() const { return m_assoc; }          // WI-010
 
     uint64_t s_cows_cycles = 0;
     uint64_t s_cows_cycles_self = 0;
