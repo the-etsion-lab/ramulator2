@@ -157,6 +157,8 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
         register_stat(m_cows_cache->s_miss_not_handled_on_llc_evict).name("cows_miss_not_handled_on_llc_evict");
         register_stat(m_cows_cache->s_lookups_write_alloc).name("cows_lookups_write_alloc");
         register_stat(m_cows_cache->s_bits_set).name("cows_bits_set");
+        register_stat(m_cows_cache->s_table_reads).name("cows_table_reads");
+        register_stat(m_cows_cache->s_table_writes).name("cows_table_writes");
         register_stat(m_cows_cache->s_misses).name("cows_misses");
         register_stat(m_cows_cache->s_half_misses).name("cows_half_misses");
         register_stat(m_cows_cache->s_hits).name("cows_hits");

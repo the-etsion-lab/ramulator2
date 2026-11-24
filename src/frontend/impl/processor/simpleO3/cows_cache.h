@@ -285,9 +285,11 @@ public:
                 set.erase(it);
                 set.push_back(page);
 
-                if(page->isDirty()) {
-                    // TODO write back to memory
-                    page->setDirty(false);
+                // WI-004 D3: a dirty victim entry is written back to the CoWs table. Counted only: table writes are
+                // off the critical path and have no DRAM traffic in this model (D-05).
+                if(victim->isDirty()) {
+                    victim->setDirty(false);
+                    m_cows_cache->s_table_writes++;
                 }
 
                 m_cows_cache->s_evicts++;
@@ -382,6 +384,8 @@ public:
     uint64_t s_miss_not_handled_on_llc_evict = 0;
     uint64_t s_lookups_write_alloc = 0;   // WI-004 D2: LLC-miss lookups for write-allocate fills (bit NOT set there)
     uint64_t s_bits_set = 0;              // WI-004 D2: written-block bits set (dirty LLC writebacks to a block not yet set)
+    uint64_t s_table_writes = 0;          // WI-004 D3: dirty CoWs entries written back to the table (evictions + C1 updates)
+    uint64_t s_table_reads = 0;           // WI-004 D3: entries fetched from the table (real misses on all paths + C1 fetches)
 
     uint64_t s_cows_cycles = 0;
     uint64_t s_cows_cycles_self = 0;

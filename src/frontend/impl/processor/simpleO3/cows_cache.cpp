@@ -351,6 +351,7 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_hit(Addr_t baddr, bool is_write,
 
         // miss latency is at least a cows cache access latency
         latency += get_dram_latency_on_translation(page_num);
+        s_table_reads++;   // WI-004 D3
 
         page->setWhenReady(clk + latency);
         page->setPending(true);
@@ -431,6 +432,7 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_miss(Addr_t baddr, bool is_write
         track_misses(clk, total_llc_misses);
 
         latency += get_dram_latency_on_translation(page_num);
+        s_table_reads++;   // WI-004 D3
 
         page->setWhenReady(clk + latency);
         page->setPending(true);
@@ -475,6 +477,11 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_evict(Addr_t baddr, bool evict_d
         // updated there without being installed (bit/dirty already set by the policy): charge the table latency.
         latency += get_dram_latency_on_translation(page_num);
         s_cows_cycles += latency;
+        s_table_reads++;
+        if(page->isDirty()) {   // updated in place in the table: one table write, the entry is clean afterwards
+            page->setDirty(false);
+            s_table_writes++;
+        }
         return {true, latency, true};
     }
     if(m_always_miss) {
@@ -508,6 +515,7 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_evict(Addr_t baddr, bool evict_d
         track_misses(clk, total_llc_misses);
 
         latency += get_dram_latency_on_translation(page_num);
+        s_table_reads++;   // WI-004 D3
 
         page->setWhenReady(clk + latency);
         page->setPending(true);
