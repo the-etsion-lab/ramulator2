@@ -300,7 +300,7 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_hit(Addr_t baddr, bool is_write,
     // access cows cache
     //
     // tell the replacement policy we have an llc write hit
-    auto set = m_cache_sets[set_idx];
+    auto& set = m_cache_sets[set_idx];   // WI-004 D1: the real set, not a copy
 
     auto [cows_cache_miss, cows_cache_evicted, miss_not_handled] = m_policy->llc_hit(set, page, block_idx, is_write);
     if(miss_not_handled) {
@@ -452,7 +452,7 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_evict(Addr_t baddr, bool evict_d
     latency += m_access_latency;
     s_cows_cycles_self += m_access_latency;
 
-    auto set = m_cache_sets[set_idx];
+    auto& set = m_cache_sets[set_idx];   // WI-004 D1: the real set, not a copy
 
     auto [cows_cache_miss, cows_cache_evicted, miss_not_handled] = m_policy->llc_evict(set, page, block_idx);
     if(miss_not_handled) {
