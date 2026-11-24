@@ -159,7 +159,7 @@ public:
             }
 
             bool checkIfReady(Clk_t now) {
-                if(now > ready_clk) {
+                if(now >= ready_clk) {   // WI-004 C2: ready at ready_clk (consistent with lookups)
                     ready = true;
                     pending = false;
                 }

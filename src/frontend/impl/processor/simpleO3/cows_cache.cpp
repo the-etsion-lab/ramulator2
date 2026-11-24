@@ -302,7 +302,6 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_hit(Addr_t baddr, bool is_write,
 
     // miss latency is at least a cows cache access latency
     uint32_t latency = m_access_latency;
-    s_cows_cycles_self += m_access_latency;
 
     //
     // access cows cache
@@ -317,6 +316,7 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_hit(Addr_t baddr, bool is_write,
         // the miss cannot be handled (e.g., all lines in the set are pending). For simplicity we treat it as a miss and retry later.
         return {true, 0, true};
     }
+    s_cows_cycles_self += m_access_latency;   // WI-004 C2: handled lookups only
     if(m_always_miss) {
         cows_cache_miss = true;
     }
@@ -332,11 +332,11 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_hit(Addr_t baddr, bool is_write,
     m_stats_set_access[set_idx]++;
 
     // hit-under-miss?
-    if(!cows_cache_miss && !page->isReady()) {
+    if(!cows_cache_miss && !page->checkIfReady(clk)) {   // WI-004 C2: ready iff clk >= ready_clk
 
         cows_cache_miss = true;
         assert(page->getWhenReady() > clk);
-        latency = page->getWhenReady() - clk;
+        latency = std::max<Clk_t>(m_access_latency, page->getWhenReady() - clk);   // WI-004 C2
 
         s_half_misses_on_llc_hit++;
         s_half_misses++;
@@ -376,7 +376,6 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_miss(Addr_t baddr, bool is_write
 
     // miss latency is at least a cows cache access latency
     uint32_t latency = m_access_latency;
-    s_cows_cycles_self += m_access_latency;
 
     // get page data from main db
     auto [perf_miss, page] = perfect_cache_lookup(page_addr);
@@ -398,6 +397,7 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_miss(Addr_t baddr, bool is_write
         // the miss cannot be handled (e.g., all lines in the set are pending). For simplicity we treat it as a miss and retry later.
         return {true, 0, true}; // treat it as a miss, but return the latency of just accessing the cows cache. The caller should retry this access later.
     }
+    s_cows_cycles_self += m_access_latency;   // WI-004 C2: handled lookups only
     if(m_always_miss) {
         cows_cache_miss = true;
     }
@@ -412,13 +412,13 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_miss(Addr_t baddr, bool is_write
     m_stats_set_access[set_idx]++;
 
     // hit-under-miss?
-    if(!cows_cache_miss && !page->isReady()) {
+    if(!cows_cache_miss && !page->checkIfReady(clk)) {   // WI-004 C2: ready iff clk >= ready_clk
         cows_cache_miss = true;
-        if(page->getWhenReady() < clk) {
+        if(page->getWhenReady() <= clk) {
             fprintf(stderr, "Error: page should not be ready yet. clk=%lu, when_ready=%lu\n", clk, page->getWhenReady());
         }
-        assert(page->getWhenReady() >= clk);
-        latency = page->getWhenReady() - clk;
+        assert(page->getWhenReady() > clk);
+        latency = std::max<Clk_t>(m_access_latency, page->getWhenReady() - clk);   // WI-004 C2
 
         s_half_misses_on_llc_miss++;
         s_half_misses++;
@@ -465,7 +465,6 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_evict(Addr_t baddr, bool evict_d
     // now update the real cache we had a miss
     //
     latency += m_access_latency;
-    s_cows_cycles_self += m_access_latency;
 
     auto& set = m_cache_sets[set_idx];   // WI-004 D1: the real set, not a copy
 
@@ -484,6 +483,7 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_evict(Addr_t baddr, bool evict_d
         }
         return {true, latency, true};
     }
+    s_cows_cycles_self += m_access_latency;   // WI-004 C2: handled lookups only
     if(m_always_miss) {
         cows_cache_miss = true;
     }
@@ -498,10 +498,10 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_evict(Addr_t baddr, bool evict_d
     m_stats_set_access[set_idx]++;
 
     // hit-under-miss?
-    if(!cows_cache_miss && !page->isReady()) {
+    if(!cows_cache_miss && !page->checkIfReady(clk)) {   // WI-004 C2: ready iff clk >= ready_clk
         cows_cache_miss = true;
-        assert(page->getWhenReady() >= clk);
-        latency = page->getWhenReady() - clk;
+        assert(page->getWhenReady() > clk);
+        latency = std::max<Clk_t>(m_access_latency, page->getWhenReady() - clk);   // WI-004 C2
 
         s_half_misses_on_llc_evict++;
         s_half_misses++;

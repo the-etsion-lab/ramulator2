@@ -49,7 +49,9 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
 
       bool cows_enable = param<bool>("cows_enable").desc("Enable CoWs.").required();
       uint32_t dram_latency_on_translation = param<int>("cows_dram_latency_on_translation").desc("DRAM latency for COWs mapping translations.").required();
-      uint32_t cows_cache_access_latency = param<int>("cows_cache_access_latency").desc("No. of cycles to access the CoWs cache.").required();
+      // WI-004 D8: the CoWs cache lives in the LLC; a lookup is serial to the LLC tag miss. Default 50 = one LLC access
+      // (PI ruling 2026-11-24; EXP-02 sweeps {0, 25, 50}).
+      uint32_t cows_cache_access_latency = param<int>("cows_cache_access_latency").desc("No. of cycles to access the CoWs cache.").default_val(50);
       uint32_t llc2cows_ratio = param<uint32_t>("cows_cache2llc_ratio").desc("Ratio between the number of LLC cache lines and CoWs cache entries.").required();
       uint32_t cows_cache_assoc = param<uint32_t>("cows_cache_assoc").desc("Associativity of CoWs cache.").required();
       uint32_t dram_page_bytes = parse_capacity_str(param<std::string>("dram_page_bytes").desc("size of DRAM page.").required());
