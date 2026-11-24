@@ -11,6 +11,9 @@
 
 namespace Ramulator {
 
+class IDRAM;
+class IAddrMapper;
+
 class IMemorySystem : public TopLevel<IMemorySystem> {
   RAMULATOR_REGISTER_INTERFACE(IMemorySystem, "MemorySystem", "Memory system interface (e.g., communicates between processor and memory controller).")
 
@@ -53,6 +56,13 @@ class IMemorySystem : public TopLevel<IMemorySystem> {
      * @return   false    Request is rejected by the memory system, maybe the memory controller is full?
      */
     virtual bool send(Request req) = 0;
+
+    /**
+     * @brief    WI-004: the DRAM device model and address mapper, for front ends that must check that their
+     *           structures agree with the DRAM geometry. nullptr if the memory system has none.
+     */
+    virtual IDRAM* get_dram() { return nullptr; };
+    virtual IAddrMapper* get_addr_mapper() { return nullptr; };
 
     /**
      * @brief         Ticks the memory system

@@ -47,6 +47,9 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
 
     void setup(IFrontEnd* frontend, IMemorySystem* memory_system) override { }
 
+    IDRAM* get_dram() override { return m_dram; };
+    IAddrMapper* get_addr_mapper() override { return m_addr_mapper; };
+
     bool send(Request req) override {
       m_addr_mapper->apply(req);
       int channel_id = req.addr_vec[0];
