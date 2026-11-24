@@ -45,6 +45,12 @@ class IDRAMController : public Clocked<IDRAMController> {
     virtual bool priority_send(Request& req) = 0;
 
     /**
+     * @brief       WI-005: true if a request in the active buffer other than *req_it targets the same bank as *req_it,
+     *              i.e. closing that bank now would close a row another request has opened and still needs.
+     */
+    virtual bool other_active_request_in_bank(const ReqBuffer::iterator& req_it) { return false; };
+
+    /**
      * @brief       Ticks the memory controller.
      * 
      */

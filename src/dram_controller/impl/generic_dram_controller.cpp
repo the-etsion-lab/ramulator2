@@ -30,6 +30,11 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
 
     int m_bank_addr_idx = -1;
 
+    // WI-005: strict closed-row mode. Every RD/WR request is served with an auto-precharge command (RDA/WRA), so the
+    // bank closes after every access and no request can hit an open row.
+    bool m_auto_precharge = false;
+    int m_cmd_RD = -1, m_cmd_WR = -1, m_cmd_RDA = -1, m_cmd_WRA = -1;
+
     float m_wr_low_watermark;
     float m_wr_high_watermark;
     bool  m_is_write_mode = false;
@@ -123,6 +128,17 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     void setup(IFrontEnd* frontend, IMemorySystem* memory_system) override {
       m_dram = memory_system->get_ifce<IDRAM>();
       m_bank_addr_idx = m_dram->m_levels("bank");
+
+      m_auto_precharge = param<bool>("auto_precharge")
+        .desc("Strict closed-row: serve every read/write with RDA/WRA (auto-precharge).").default_val(false);
+      if (m_auto_precharge) {
+        for (auto c : {"RD", "WR", "RDA", "WRA"}) {
+          if (!m_dram->m_commands.contains(c))
+            throw ConfigurationError("auto_precharge requires DRAM command {} in {}!", c, m_dram->get_name());
+        }
+        m_cmd_RD = m_dram->m_commands("RD");   m_cmd_WR = m_dram->m_commands("WR");
+        m_cmd_RDA = m_dram->m_commands("RDA"); m_cmd_WRA = m_dram->m_commands("WRA");
+      }
       m_priority_buffer.max_size = 512*3 + 32;
 
       m_controller_stats_name += std::to_string(m_channel_id);
@@ -167,6 +183,10 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
 
     bool send(Request& req) override {
       req.final_command = m_dram->m_request_translations(req.type_id);
+      if (m_auto_precharge) {
+        if      (req.final_command == m_cmd_RD) req.final_command = m_cmd_RDA;
+        else if (req.final_command == m_cmd_WR) req.final_command = m_cmd_WRA;
+      }
 
 //      printf("DRAM Controller: Received request. clk=%lu, addr=0x%lx, type=%d, cache_status=%d\n", m_clk, req.addr, req.type_id, req.cache_status);
 
@@ -219,6 +239,23 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
 
       return true;
     };
+
+    bool other_active_request_in_bank(const ReqBuffer::iterator& req_it) override {
+      for (auto _it = m_active_buffer.begin(); _it != m_active_buffer.end(); _it++) {
+        if (&*_it == &*req_it)
+          continue;
+        bool is_matching = true;
+        for (int i = 0; i < m_bank_addr_idx + 1; i++) {
+          if (_it->addr_vec[i] != req_it->addr_vec[i] && _it->addr_vec[i] != -1 && req_it->addr_vec[i] != -1) {
+            is_matching = false;
+            break;
+          }
+        }
+        if (is_matching)
+          return true;
+      }
+      return false;
+    }
 
     bool priority_send(Request& req) override {
       req.final_command = m_dram->m_request_translations(req.type_id);
@@ -449,6 +486,11 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         if (m_dram->m_command_meta(req_it->command).is_closing) {
           auto& rowgroup = req_it->addr_vec;
           for (auto _it = m_active_buffer.begin(); _it != m_active_buffer.end(); _it++) {
+            // WI-005: an RDA/WRA scheduled from the active buffer closes the row its own request opened; it must not
+            // block itself. (Without auto_precharge no closing command is ever scheduled from the active buffer.)
+            if (req_buffer == &m_active_buffer && _it == req_it) {
+              continue;
+            }
             auto& _it_rowgroup = _it->addr_vec;
             bool is_matching = true;
             for (int i = 0; i < m_bank_addr_idx + 1 ; i++) {
@@ -458,6 +500,9 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
               }
             }
             if (is_matching) {
+              // WI-005: in strict mode a second request cannot have opened the same bank (every access closes it)
+              if (m_auto_precharge && req_buffer == &m_active_buffer)
+                throw std::runtime_error("auto_precharge: two active-buffer requests share a bank (impossible in strict mode)");
               request_found = false;
               break;
             }
