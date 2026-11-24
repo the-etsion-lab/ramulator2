@@ -199,6 +199,9 @@ class DDR5COW : public IDRAM, public Implementation {
 
     std::vector<size_t> s_total_rfm_cycles;
 
+    // WI-005: number of issued commands per command type (all channels; resettable at warmup)
+    std::vector<size_t> s_num_cmds;
+
   /************************************************
    *                 RFM Related
    ***********************************************/
@@ -233,10 +236,32 @@ class DDR5COW : public IDRAM, public Implementation {
       set_powers();
 
       create_nodes();
+
+      // WI-005: per-command issue counts (independent of drampower_enable)
+      s_num_cmds.resize(m_commands.size(), 0);
+      for (auto cmd : {"ACT", "PRE", "PREA", "PREsb", "RD", "WR", "RDA", "WRA", "REFab", "REFsb", "RFMab", "RFMsb", "DRFMab", "DRFMsb"}) {
+        register_stat(s_num_cmds[m_commands(cmd)]).name("num_cmd_{}", cmd);
+      }
+    };
+
+    /**
+     * WI-005: at the warmup reset the registered energy/cycle stats and the per-rank command counters were zeroed;
+     * restart the current active/idle interval of every rank at the reset clock so all energy components share
+     * the post-warmup window. A rank that is refreshing keeps its state; REF*_end restarts its idle interval.
+     */
+    void on_reset_stats() override {
+      for (auto& ps : m_power_stats) {
+        if (ps.cur_power_state == PowerStats::PowerState::ACTIVE) {
+          ps.active_start_cycle = m_clk;
+        } else if (ps.cur_power_state == PowerStats::PowerState::IDLE) {
+          ps.idle_start_cycle = m_clk;
+        }
+      }
     };
 
     void issue_command(int command, const AddrVec_t& addr_vec) override {
       int channel_id = addr_vec[m_levels["channel"]];
+      s_num_cmds[command]++;
       m_channels[channel_id]->update_timing(command, addr_vec, m_clk);
       m_channels[channel_id]->update_powers(command, addr_vec, m_clk);
       m_channels[channel_id]->update_states(command, addr_vec, m_clk);
@@ -757,6 +782,11 @@ class DDR5COW : public IDRAM, public Implementation {
         register_stat(power_stat.total_refresh_energy).name("total_refresh_energy_rank{}", power_stat.rank_id);
         register_stat(power_stat.active_cycles).name("active_cycles_rank{}", power_stat.rank_id);
         register_stat(power_stat.idle_cycles).name("idle_cycles_rank{}", power_stat.rank_id);
+        // WI-005: DRAMPower command counters as registered stats: reset at warmup (same window as active/idle_cycles)
+        // and dumped, so energy can be recomputed offline for other IDD/VDD values.
+        for (auto cmd : {"ACT", "PRE", "RD", "WR", "REF", "RFM"}) {
+          register_stat(power_stat.cmd_counters[m_cmds_counted(cmd)]).name("cmd_{}_rank{}", cmd, power_stat.rank_id);
+        }
       }
     }
 

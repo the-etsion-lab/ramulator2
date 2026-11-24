@@ -198,11 +198,19 @@ class Implementation {
     void reset_stats() {
       // Reset all my stats
       m_stats.reset();
+      // Let the implementation restart any interval bookkeeping that is not a registered stat
+      on_reset_stats();
       // Print all my children
       for (auto child_impl : m_children) {
         child_impl->reset_stats();
       }
     };
+
+    /**
+     * @brief    Hook called by reset_stats() after this implementation's registered stats were reset (default: nothing).
+     *
+     */
+    virtual void on_reset_stats() {};
 
     std::string get_id() const { return m_id; };
     void set_id(std::string id) { m_id = id; };
