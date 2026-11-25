@@ -7,7 +7,7 @@ Method:
   - The measured window of a run is instructions [warmup, num_expected_insts) of every core (warmup = warmup_insts, or
     warmup_percent x num_expected_insts if warmup_insts is 0), i.e. the region [a, b) of run.sh's R<a>-<b>.
   - coreN_ipc_stats holds one (cycle, IPC) sample per ~1M retired instructions; sample k covers instructions (k, k+1] x 1M.
-    The samples of the window are split into 10 equal groups; interval IPC of a core = sum(insts) / sum(cycles); interval IPC of
+    The samples of the window are split into 10 equal groups (fewer, >= 5, if the window has < 10 samples); interval IPC of a core = sum(insts) / sum(cycles); interval IPC of
     the run = mean over cores (the per-core-mean IPC of EXP-01).
   - IPC: mean over intervals and 95% CI half-width t(0.975, n-1) x sd / sqrt(n).
   - Ratio vs baseline (same benchmark, same region, same instruction intervals): per-interval ratio, mean, 95% CI.
@@ -48,12 +48,14 @@ def interval_ipc(d, n_iv):
             rec.append((ipc * (cyc - prev), cyc - prev)); prev = cyc
         lo, hi = math.ceil(W / 1e6), int(N // 1e6)
         win = rec[lo:hi]
+        n_iv = min(n_iv, len(win))   # short windows (smoke tests): one 1M-instruction sample per interval
+        if n_iv < 5:
+            raise SystemExit(f"{d}: core {c} has {len(win)} 1M-instruction samples in the window; at least 5 are needed")
         g = len(win) // n_iv
-        if g == 0:
-            raise SystemExit(f"{d}: core {c} has {len(win)} samples in the window, fewer than {n_iv} intervals")
         per_core.append([sum(i for i, _ in win[k*g:(k+1)*g]) / sum(cy for _, cy in win[k*g:(k+1)*g]) for k in range(n_iv)])
         c += 1
-    return [S.mean(core[k] for core in per_core) for k in range(n_iv)]
+    n = min(len(core) for core in per_core)
+    return [S.mean(core[k] for core in per_core) for k in range(n)]
 
 
 def ci(v):
@@ -67,18 +69,20 @@ def main():
     n_iv, thr = opt("--intervals", 10), opt("--threshold", 0.98)
     run, base = a[0], (a[1] if len(a) > 1 else None)
     N, W, skip = cfg(run)
-    cols = ["run", "region_start", "region_end", "trunc", "ipc_mean", "ipc_ci95", "base_ipc_mean", "ratio_mean", "ratio_ci_low",
+    cols = ["run", "region_start", "region_end", "trunc", "n_intervals", "ipc_mean", "ipc_ci95", "base_ipc_mean", "ratio_mean", "ratio_ci_low",
             "ratio_ci_high", "pass"]
     if "--header" in sys.argv:
         print(",".join(cols))
-    r = {"run": run, "region_start": skip + W, "region_end": skip + N, "trunc": truncated(run) or (base and truncated(base))}
+    r = {"run": run, "region_start": skip + W, "region_end": skip + N, "trunc": bool(truncated(run) or (base and truncated(base)))}
     iv = interval_ipc(run, n_iv)
     r["ipc_mean"], r["ipc_ci95"] = ci(iv)
+    r["n_intervals"] = len(iv)
     if base:
         if cfg(base) != (N, W, skip):
             raise SystemExit(f"baseline region {cfg(base)} != run region {(N, W, skip)}")
         bv = interval_ipc(base, n_iv)
-        m, h = ci([x / y for x, y in zip(iv, bv)])
+        n = min(len(iv), len(bv))
+        m, h = ci([x / y for x, y in zip(iv[:n], bv[:n])])
         r.update(base_ipc_mean=S.mean(bv), ratio_mean=m, ratio_ci_low=m - h, ratio_ci_high=m + h,
                  **{"pass": (not r["trunc"]) and (m - h >= thr)})
     f = lambda v: f"{v:.5g}" if isinstance(v, float) else str(v)
