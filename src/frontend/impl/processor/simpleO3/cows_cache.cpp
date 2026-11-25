@@ -282,7 +282,17 @@ void CoWsCache::maybe_redirect(Request& req, bool is_fill) {
         row_id = permute(pool_idx, std::countr_zero(m_total_rows));
         src_page = (Addr_t)(row_id << AddrParser::getDramPageBits());   // 4KB-aligned linear address = one row anywhere
     } else {   // SAME_BANK: keep channel/rank/bankgroup/bank, replace the row field
-        uint64_t row = permute(pool_idx, std::countr_zero(m_rows_per_bank));
+        // Sources must be distinct only within a bank: per-bank first-touch order modulo the bank's share of the pool
+        // (ceil(pool / banks), at most the rows of a bank). The bank is identified by the address bits between the page and the
+        // row field (channel/rank/bankgroup/bank under the row-on-top mappings the startup probe accepts).
+        Line& pl = it->second;
+        if (pl.bank_touch_order < 0) {
+            uint64_t bank = (uint64_t)ap.getPageNum() & ((1ull << (m_row_shift - AddrParser::getDramPageBits())) - 1);
+            pl.bank_touch_order = (int64_t)m_bank_touch[bank]++;
+        }
+        uint64_t banks = m_total_rows / m_rows_per_bank;
+        uint64_t per_bank_pool = std::min<uint64_t>(m_rows_per_bank, (m_source_pool + banks - 1) / banks);
+        uint64_t row = permute((uint64_t)pl.bank_touch_order % per_bank_pool, std::countr_zero(m_rows_per_bank));
         Addr_t row_mask = (Addr_t)(m_rows_per_bank - 1) << m_row_shift;
         src_page = (ap.getPageAddr() & ~row_mask) | (Addr_t)(row << m_row_shift);
         row_id = (uint64_t)src_page >> AddrParser::getDramPageBits();

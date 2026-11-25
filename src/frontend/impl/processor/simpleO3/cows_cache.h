@@ -115,6 +115,7 @@ public:
         public:
             Line() : block_map(CoWsCache::AddrParser::getNumBlocksPerPage()) { reset(); }
             uint64_t touch_order = 0;   // WI-013: order in which the page was first touched (source pool index = order mod pool)
+            int64_t bank_touch_order = -1;   // WI-013 same_bank: first-touch order within the page's own bank (-1: not yet assigned)
 
             void reset() {
                 valid = false;
@@ -414,6 +415,7 @@ public:
     uint64_t s_distinct_source_rows = 0;  // distinct source rows read so far; whole run
     uint64_t m_next_touch = 0;
     std::unordered_set<uint64_t> m_used_source_rows;
+    std::unordered_map<uint64_t, uint64_t> m_bank_touch;   // same_bank: next first-touch index per bank
     // called for every request the LLC sends to memory for a miss; may rewrite req.addr (original kept in orig_addr)
     void maybe_redirect(Request& req, bool is_fill);
     // bijection on [0, 2^bits): odd multiplies and xorshifts modulo 2^bits (no two pool indices share a row)

@@ -417,9 +417,11 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
         if ((total_rows & (total_rows - 1)) != 0 || (rows & (rows - 1)) != 0) {
           throw ConfigurationError("CoWs source placement needs power-of-2 row counts (total {}, per bank {})", total_rows, rows);
         }
-        uint64_t space = m_cows_placement == "same_bank" ? (uint64_t)rows : total_rows;
-        if (m_cows_placement != "self" && m_cows_cache->m_source_pool > space) {
-          throw ConfigurationError("cows_source_pool {} exceeds the {} available source rows", m_cows_cache->m_source_pool, space);
+        if (m_cows_placement != "self" && m_cows_cache->m_source_pool > total_rows) {   // same_bank: split over banks, capped per bank
+          throw ConfigurationError("cows_source_pool {} exceeds the {} rows of the memory", m_cows_cache->m_source_pool, total_rows);
+        }
+        if (m_cows_placement == "same_bank" && (uint64_t)1 << (m_cows_cache->m_row_shift - calc_log2(m_cows_page_bytes)) != total_rows / rows) {
+          throw ConfigurationError("same_bank: the address bits between page and row field do not enumerate the {} banks", total_rows / rows);
         }
         if (m_cows_placement == "random") {   // linear 4KB-aligned addresses below total_rows x page must cover distinct rows
           auto a = mapv((Addr_t)(total_rows - 1) * m_cows_page_bytes), w = mapv((Addr_t)total_rows * m_cows_page_bytes);
