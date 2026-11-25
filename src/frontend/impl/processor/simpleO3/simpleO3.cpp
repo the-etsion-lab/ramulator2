@@ -32,8 +32,6 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
 
     size_t m_num_expected_insts = 0;
     size_t m_warmup_percent = 0;
-    size_t m_skip_insts = 0;     // WI-013
-    size_t m_warmup_insts = 0;   // WI-013
 
     std::string serialization_filename;
 
@@ -102,13 +100,6 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
       // Simulation parameters
       m_num_expected_insts = param<size_t>("num_expected_insts").desc("Number of instructions that the frontend should execute.").required();
       m_warmup_percent = param<size_t>("warmup_percent").desc("Percent of the run that is considered warmup.").required();
-      // WI-013 region runner: skip the first skip_insts instructions of every trace functionally, then simulate num_expected_insts,
-      // of which the first warmup_insts (if > 0, overriding warmup_percent) are warmup.
-      m_skip_insts = param<size_t>("skip_insts").desc("Instructions skipped functionally at the start of each trace.").default_val(0);
-      m_warmup_insts = param<size_t>("warmup_insts").desc("Absolute warmup instructions (0: use warmup_percent).").default_val(0);
-      if (m_warmup_insts >= m_num_expected_insts && m_warmup_insts > 0) {
-        throw ConfigurationError("warmup_insts ({}) must be < num_expected_insts ({})", m_warmup_insts, m_num_expected_insts);
-      }
 
       // Create address translation module
       m_translation = create_child_ifce<ITranslation>();
@@ -152,8 +143,7 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
       // Create the cores
       SimpleO3Core::Trace::dram_page_bytes = dram_page_bytes;
       for (int id = 0; id < m_num_cores; id++) {
-        SimpleO3Core* core = new SimpleO3Core(id, ipc, depth, m_num_expected_insts, m_warmup_percent, trace_list[id], cows_accel_zero_page, m_translation, m_llc,
-                                              m_warmup_insts, m_skip_insts);
+        SimpleO3Core* core = new SimpleO3Core(id, ipc, depth, m_num_expected_insts, m_warmup_percent, trace_list[id], cows_accel_zero_page, m_translation, m_llc);
         core->m_callback = [this](Request& req){return this->receive(req);} ;
         m_cores.push_back(core);
       }
