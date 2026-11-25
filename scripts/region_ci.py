@@ -11,7 +11,7 @@ Method:
     the run = mean over cores (the per-core-mean IPC of EXP-01).
   - IPC: mean over intervals and 95% CI half-width t(0.975, n-1) x sd / sqrt(n).
   - Ratio vs baseline (same benchmark, same region, same instruction intervals): per-interval ratio, mean, 95% CI.
-    PASS iff the CI lower bound >= threshold (0.98 = within 2%).
+    PASS iff the CI lower bound >= threshold (0.98 = within 2%), per benchmark. Per-interval ratios are listed (W6).
   - A run whose cores were zeroed by the global warmup reset (TRUNC, see NOTES) is reported as TRUNC and never passes.
 Output: one CSV line on stdout (header with --header).
 """
@@ -70,7 +70,7 @@ def main():
     run, base = a[0], (a[1] if len(a) > 1 else None)
     N, W, skip = cfg(run)
     cols = ["run", "region_start", "region_end", "trunc", "n_intervals", "ipc_mean", "ipc_ci95", "base_ipc_mean", "ratio_mean", "ratio_ci_low",
-            "ratio_ci_high", "pass"]
+            "ratio_ci_high", "pass", "interval_ratios"]
     if "--header" in sys.argv:
         print(",".join(cols))
     r = {"run": run, "region_start": skip + W, "region_end": skip + N, "trunc": bool(truncated(run) or (base and truncated(base)))}
@@ -83,6 +83,7 @@ def main():
         bv = interval_ipc(base, n_iv)
         n = min(len(iv), len(bv))
         m, h = ci([x / y for x, y in zip(iv[:n], bv[:n])])
+        r["interval_ratios"] = ";".join(f"{x / y:.4f}" for x, y in zip(iv[:n], bv[:n]))
         r.update(base_ipc_mean=S.mean(bv), ratio_mean=m, ratio_ci_low=m - h, ratio_ci_high=m + h,
                  **{"pass": (not r["trunc"]) and (m - h >= thr)})
     f = lambda v: f"{v:.5g}" if isinstance(v, float) else str(v)
