@@ -264,6 +264,11 @@ void CoWsCache::maybe_redirect(Request& req, bool is_fill) {
         s_written_block_misses++;
         return;   // written block: it lives in the page's own row
     }
+    if (m_renamed_fraction < 1.0 &&
+        (double)(mix64((uint64_t)ap.getPageNum() ^ 0xF4AC7105ull) >> 11) * 0x1.0p-53 >= m_renamed_fraction) {
+        s_not_renamed_unwritten_misses++;
+        return;   // page not renamed: its data lives in its own row
+    }
     s_unwritten_block_misses++;
     if (m_placement == Placement::SELF) {
         return;   // today's model: the data is read from the own row

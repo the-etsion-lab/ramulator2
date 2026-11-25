@@ -401,6 +401,8 @@ public:
     enum class Placement { SELF, RANDOM, SAME_BANK };
     Placement m_placement = Placement::SELF;
     uint64_t m_source_pool = 0;        // number of distinct source rows
+    double m_renamed_fraction = 1.0;   // fraction of tracked pages that are renamed (seeded hash of the page); 1.0 = all (worst case)
+    uint64_t s_not_renamed_unwritten_misses = 0;   // unwritten-block misses of pages that are not renamed (read at the own row)
     uint64_t m_total_rows = 0;         // all rows of the memory (channel x rank x bg x bank x row)
     uint64_t m_rows_per_bank = 0;
     uint32_t m_row_shift = 0;          // address bit of the row field (same_bank)

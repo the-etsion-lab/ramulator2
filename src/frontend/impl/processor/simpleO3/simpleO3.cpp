@@ -198,6 +198,12 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
         register_stat(m_cows_cache->s_table_writes).name("cows_table_writes");
         // WI-013
         m_cows_cache->m_source_pool = m_cows_source_pool;
+        m_cows_cache->m_renamed_fraction = param<double>("cows_renamed_fraction")
+          .desc("WI-013: fraction of tracked pages that are renamed (seeded page hash); 1.0 = every touched page (worst case).").default_val(1.0);
+        if (m_cows_cache->m_renamed_fraction < 0.0 || m_cows_cache->m_renamed_fraction > 1.0) {
+          throw ConfigurationError("cows_renamed_fraction must be in [0, 1]");
+        }
+        register_stat(m_cows_cache->s_not_renamed_unwritten_misses).name("cows_not_renamed_unwritten_misses");
         m_cows_cache->m_placement = m_cows_placement == "random" ? CoWsCache::Placement::RANDOM
                                   : m_cows_placement == "same_bank" ? CoWsCache::Placement::SAME_BANK : CoWsCache::Placement::SELF;
         register_stat(m_cows_cache->s_redirected_reads).name("cows_redirected_reads");
