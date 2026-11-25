@@ -46,7 +46,8 @@ class SimpleO3Core : public Clocked<SimpleO3Core> {
     static const size_t INST_READ_BATCH = 100000;
 
     public:
-      Trace(std::string file_path_str, bool cows_accel_zero_page);
+      Trace(std::string file_path_str, bool cows_accel_zero_page, size_t skip_insts = 0);
+      size_t m_skipped_insts = 0;   // WI-013: instructions consumed functionally before the simulation starts
       const Inst& get_next_inst();
       bool read_next_inst();
 
@@ -159,7 +160,8 @@ class SimpleO3Core : public Clocked<SimpleO3Core> {
     size_t s_prev_clk = 0;
 
   public:
-    SimpleO3Core(int id, int ipc, int depth, size_t num_expected_insts, size_t warmup_percent, std::string trace_path, bool cows_accel_zero_page, ITranslation* translation, SimpleO3LLC* llc);
+    SimpleO3Core(int id, int ipc, int depth, size_t num_expected_insts, size_t warmup_percent, std::string trace_path, bool cows_accel_zero_page, ITranslation* translation, SimpleO3LLC* llc,
+                 size_t warmup_insts = 0, size_t skip_insts = 0);
 
     /**
      * @brief   Ticks the core.

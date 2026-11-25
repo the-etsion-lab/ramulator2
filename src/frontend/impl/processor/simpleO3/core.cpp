@@ -16,7 +16,7 @@ namespace fs = std::filesystem;
 
 uint32_t SimpleO3Core::Trace::dram_page_bytes = 8192;
 
-SimpleO3Core::Trace::Trace(std::string file_path_str, bool cows_accel_zero_page) {
+SimpleO3Core::Trace::Trace(std::string file_path_str, bool cows_accel_zero_page, size_t skip_insts) {
   m_file_path_str = file_path_str;
   m_cows_accel_zero_page = cows_accel_zero_page;
 
@@ -46,6 +46,22 @@ SimpleO3Core::Trace::Trace(std::string file_path_str, bool cows_accel_zero_page)
   const std::string IN_UTIL = "zstdcat";
   std::string in_cmd = IN_UTIL + " " + path_tokens[0];
   m_trace_file = std::make_unique<PopenIstream>(in_cmd);
+
+  // WI-013 region runner: functional skip. Consume whole trace lines (each = <bubbles> non-memory insts + 1 memory inst) until
+  // at least skip_insts instructions are skipped. No cache/DRAM state is touched (the following warmup warms the caches).
+  if (skip_insts > 0) {
+    std::string line;
+    while (m_skipped_insts < skip_insts && std::getline(*m_trace_file, line)) {
+      m_trace_nline++;
+      size_t p = line.find_first_not_of(" \t");
+      if (p == std::string::npos || line[p] == '#') continue;
+      m_skipped_insts += std::stoull(line.substr(p)) + 1;
+    }
+    if (m_skipped_insts < skip_insts) {
+      throw ConfigurationError("Trace {} ends after {} instructions, before skip_insts={}", file_path_str, m_skipped_insts, skip_insts);
+    }
+    printf("# Skipped %lu instructions (%lu lines) of %s\n", (unsigned long)m_skipped_insts, (unsigned long)m_trace_nline, path_tokens[0].c_str());
+  }
 }
 
 bool SimpleO3Core::Trace::read_next_inst()
@@ -176,8 +192,10 @@ void SimpleO3Core::InstWindow::set_ready(Addr_t addr) {
   }
 }
 
-SimpleO3Core::SimpleO3Core(int id, int ipc, int depth, size_t num_expected_insts, size_t warmup_percent, std::string trace_path, bool cows_accel_zero_page, ITranslation* translation, SimpleO3LLC* llc)
-  : m_id(id), m_window(ipc, depth), m_trace(trace_path, cows_accel_zero_page), m_num_expected_insts(num_expected_insts), m_warmup_percent(warmup_percent), m_num_warmup_insts(warmup_percent * num_expected_insts / 100), m_translation(translation), m_llc(llc) {
+SimpleO3Core::SimpleO3Core(int id, int ipc, int depth, size_t num_expected_insts, size_t warmup_percent, std::string trace_path, bool cows_accel_zero_page, ITranslation* translation, SimpleO3LLC* llc,
+                           size_t warmup_insts, size_t skip_insts)
+  : m_id(id), m_window(ipc, depth), m_trace(trace_path, cows_accel_zero_page, skip_insts), m_num_expected_insts(num_expected_insts), m_warmup_percent(warmup_percent),
+    m_num_warmup_insts(warmup_insts > 0 ? warmup_insts : warmup_percent * num_expected_insts / 100), m_translation(translation), m_llc(llc) {   // WI-013: absolute warmup overrides the percentage
   // Fetch the instructions and addresses for tick 0
   auto inst = m_trace.get_next_inst();
   m_num_bubbles = inst.bubble_count;
