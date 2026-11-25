@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "base/type.h"
+#include "base/request.h"
 #include "base/debug.h"
 
 namespace Ramulator {
@@ -393,6 +394,23 @@ public:
     uint64_t s_entry_bits = 0;
     uint64_t s_cache_bytes = 0;
     void set_source_index_bits(uint32_t src_index_bits);
+
+    // WI-013: source-row redirect of reads of unwritten blocks (every page with an entry is treated as renamed)
+    enum class Placement { SELF, RANDOM, SAME_BANK };
+    Placement m_placement = Placement::SELF;
+    uint64_t m_source_pool = 0;        // number of distinct source rows
+    uint64_t m_total_rows = 0;         // all rows of the memory (channel x rank x bg x bank x row)
+    uint64_t m_rows_per_bank = 0;
+    uint32_t m_row_shift = 0;          // address bit of the row field (same_bank)
+    uint64_t s_redirected_reads = 0;
+    uint64_t s_unwritten_block_misses = 0;
+    uint64_t s_written_block_misses = 0;
+    // called for every request the LLC sends to memory for a miss (fill); may rewrite req.addr (original kept in orig_addr)
+    void maybe_redirect(Request& req);
+    static uint64_t mix64(uint64_t x) {   // splitmix64 finalizer
+        x += 0x9E3779B97F4A7C15ull; x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull; x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+        return x ^ (x >> 31);
+    }
     uint32_t get_num_sets() const { return m_nsets; }       // WI-010
     uint32_t get_assoc() const { return m_assoc; }          // WI-010
 

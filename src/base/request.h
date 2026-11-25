@@ -11,6 +11,7 @@ namespace Ramulator {
 
 struct Request {
   Addr_t    addr = -1;
+  Addr_t    orig_addr = -1;   // WI-013: LLC-side address of a read redirected to a CoWs source row (restored on return)
   AddrVec_t addr_vec {};
 
   // Basic request id convention

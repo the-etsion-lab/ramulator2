@@ -267,7 +267,12 @@ bool SimpleO3LLC::send(Request req) {
 //    printf("LLC: MSHR New. (mshr.size=%lu). clk=%lu\n", m_mshrs.size(), m_clk);
 
     // Add to the miss request list
-    m_miss_list.push_back(std::make_pair(m_clk + m_latency + cows_latency, req));
+    // WI-013: a fill of an unwritten block of a renamed page reads the source row (the MSHR keeps the own address)
+    Request to_mem = req;
+    if (m_cows_cache != nullptr) {
+      m_cows_cache->maybe_redirect(to_mem);
+    }
+    m_miss_list.push_back(std::make_pair(m_clk + m_latency + cows_latency, to_mem));
 
     return true;
   }
@@ -275,6 +280,10 @@ bool SimpleO3LLC::send(Request req) {
 
 void SimpleO3LLC::receive(Request& req) {
   req.mc2llc = m_clk;
+  if (req.orig_addr != -1) {   // WI-013: back to the LLC-side address for MSHR matching
+    req.addr = req.orig_addr;
+    req.orig_addr = -1;
+  }
 
   Clk_t dram_read_latency =
     (req.cache_status == Request::CacheStatus::Miss ||

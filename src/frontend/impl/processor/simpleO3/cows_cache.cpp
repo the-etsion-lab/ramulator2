@@ -254,6 +254,34 @@ void CoWsCache::set_source_index_bits(uint32_t src_index_bits) {
              <<", bytes="<<s_cache_bytes<<std::endl;
 }
 
+void CoWsCache::maybe_redirect(Request& req) {
+    AddrParser ap(req.addr);
+    auto it = m_perfect_cache.find(ap.getPageAddr());
+    if (it == m_perfect_cache.end()) {
+        return;   // no entry (cannot happen on the LLC-miss path: the lookup creates it)
+    }
+    if (it->second.getBlockID(AddrParser::getBlockIdx(req.addr))) {
+        s_written_block_misses++;
+        return;   // written block: it lives in the page's own row
+    }
+    s_unwritten_block_misses++;
+    if (m_placement == Placement::SELF) {
+        return;   // today's model: the data is read from the own row
+    }
+    uint64_t pool_idx = mix64((uint64_t)ap.getPageNum() ^ 0x5EEDC0DEull) % m_source_pool;
+    uint64_t r = mix64(pool_idx ^ 0xC0FFEEull);
+    Addr_t src_page;
+    if (m_placement == Placement::RANDOM) {
+        src_page = (Addr_t)((r % m_total_rows) << AddrParser::getDramPageBits());   // 4KB-aligned linear address = one row anywhere
+    } else {   // SAME_BANK: keep channel/rank/bankgroup/bank, replace the row field
+        Addr_t row_mask = (Addr_t)(m_rows_per_bank - 1) << m_row_shift;
+        src_page = (ap.getPageAddr() & ~row_mask) | (Addr_t)((r % m_rows_per_bank) << m_row_shift);
+    }
+    req.orig_addr = req.addr;
+    req.addr = src_page | (req.addr & AddrParser::getDramPageOffsetMask());
+    s_redirected_reads++;
+}
+
 void CoWsCache::check_pending_lines(Clk_t clk) {
     for(auto it = m_pending_lines.begin(); it != m_pending_lines.end(); ) {
         auto* line = *it;

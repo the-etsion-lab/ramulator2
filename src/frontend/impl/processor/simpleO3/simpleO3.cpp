@@ -21,6 +21,8 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
     bool m_cows_check_page_geometry = true;    // WI-004 D10
     bool m_cows_geometry_checked = false;      // WI-004 D10
     std::string m_cows_carveout = "none";      // WI-010
+    std::string m_cows_placement = "self";     // WI-013
+    uint64_t m_cows_source_pool = 0;           // WI-013
     int m_llc_linesize_bytes = 64;             // WI-010
 
     int m_num_cores = -1;
@@ -67,6 +69,16 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
       uint32_t cows_cache_assoc = param<uint32_t>("cows_cache_assoc").desc("Associativity of CoWs cache.").required();
       uint32_t dram_page_bytes = parse_capacity_str(param<std::string>("dram_page_bytes").desc("size of DRAM page.").required());
       m_cows_page_bytes = dram_page_bytes;
+      m_cows_placement = param<std::string>("cows_source_placement")
+        .desc("WI-013: where reads of unwritten blocks go: self (own row, legacy) | random | same_bank.").default_val("self");
+      if (m_cows_placement != "self" && m_cows_placement != "random" && m_cows_placement != "same_bank") {
+        throw ConfigurationError("cows_source_placement must be self, random or same_bank (got {})", m_cows_placement);
+      }
+      m_cows_source_pool = param<uint64_t>("cows_source_pool")
+        .desc("WI-013: number of distinct source rows (required unless placement is self).").default_val(0);
+      if (cows_enable && m_cows_placement != "self" && m_cows_source_pool == 0) {
+        throw ConfigurationError("cows_source_pool must be given (> 0) with cows_source_placement {}", m_cows_placement);
+      }
       m_cows_carveout = param<std::string>("cows_carveout")
         .desc("WI-010: charge the CoWs cache's LLC capacity: none | ways | lines.").default_val("none");
       if (m_cows_carveout != "none" && m_cows_carveout != "ways" && m_cows_carveout != "lines") {
@@ -194,6 +206,13 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
         register_stat(m_cows_cache->s_bits_set).name("cows_bits_set");
         register_stat(m_cows_cache->s_table_reads).name("cows_table_reads");
         register_stat(m_cows_cache->s_table_writes).name("cows_table_writes");
+        // WI-013
+        m_cows_cache->m_source_pool = m_cows_source_pool;
+        m_cows_cache->m_placement = m_cows_placement == "random" ? CoWsCache::Placement::RANDOM
+                                  : m_cows_placement == "same_bank" ? CoWsCache::Placement::SAME_BANK : CoWsCache::Placement::SELF;
+        register_stat(m_cows_cache->s_redirected_reads).name("cows_redirected_reads");
+        register_stat(m_cows_cache->s_unwritten_block_misses).name("cows_unwritten_block_misses");
+        register_stat(m_cows_cache->s_written_block_misses).name("cows_written_block_misses");
         register_stat(m_cows_cache->s_misses).name("cows_misses");
         register_stat(m_cows_cache->s_half_misses).name("cows_half_misses");
         register_stat(m_cows_cache->s_hits).name("cows_hits");
@@ -375,7 +394,41 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
         return;
       }
       int rows = dram->get_level_size("row");
-      m_cows_cache->set_source_index_bits(calc_log2(rows));
+      // WI-013: source geometry. total rows = channel x rank x bankgroup x bank x row; the row field position for same_bank is
+      // found by probing the mapper (lowest address bit >= page bits that changes only the row, to row 1).
+      uint64_t total_rows = 1;
+      for (auto lvl : {"channel", "rank", "bankgroup", "bank", "row"}) {
+        total_rows *= dram->get_level_size(lvl);
+      }
+      m_cows_cache->m_total_rows = total_rows;
+      m_cows_cache->m_rows_per_bank = rows;
+      {
+        int row_level = dram->m_levels("row");
+        auto mapv = [&](Addr_t a) { Request r(a, Request::Type::Read); mapper->apply(r); return r.addr_vec; };
+        auto z = mapv(0);
+        for (uint32_t b = calc_log2(m_cows_page_bytes); b < 56; b++) {
+          auto v = mapv((Addr_t)1 << b);
+          bool only_row = v[row_level] == 1;
+          for (int l = 0; l < row_level && only_row; l++) only_row = (v[l] == z[l]);
+          if (only_row) { m_cows_cache->m_row_shift = b; break; }
+        }
+        if (m_cows_placement == "same_bank" && m_cows_cache->m_row_shift == 0) {
+          throw ConfigurationError("cows_source_placement same_bank: could not locate the row field in the address mapping");
+        }
+        if (m_cows_placement == "random") {   // linear 4KB-aligned addresses below total_rows x page must cover distinct rows
+          auto a = mapv((Addr_t)(total_rows - 1) * m_cows_page_bytes), w = mapv((Addr_t)total_rows * m_cows_page_bytes);
+          a.resize(row_level + 1); w.resize(row_level + 1); z.resize(row_level + 1);
+          if (w != z) {
+            throw ConfigurationError("cows_source_placement random: address space of {} rows does not wrap as expected", total_rows);
+          }
+        }
+      }
+      // D9 + WI-013: same-bank (and self = today's model) sources need log2(rows per bank) bits, random sources log2(total rows)
+      uint32_t src_bits = (m_cows_placement == "random") ? calc_log2(total_rows) : calc_log2(rows);
+      m_cows_cache->set_source_index_bits(src_bits);
+      std::cerr << "# CoWs source placement " << m_cows_placement << ": pool=" << m_cows_cache->m_source_pool << " rows, total rows="
+                << total_rows << ", rows/bank=" << rows << ", row field at bit " << m_cows_cache->m_row_shift
+                << ", src index bits=" << src_bits << std::endl;
       if (!m_cows_check_page_geometry) {
         std::cerr << "# WARNING: cows_check_page_geometry=false; CoWs page geometry not checked" << std::endl;
         return;
