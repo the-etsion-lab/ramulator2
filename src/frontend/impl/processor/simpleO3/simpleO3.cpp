@@ -203,6 +203,9 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
         register_stat(m_cows_cache->s_redirected_reads).name("cows_redirected_reads");
         register_stat(m_cows_cache->s_unwritten_block_misses).name("cows_unwritten_block_misses");
         register_stat(m_cows_cache->s_written_block_misses).name("cows_written_block_misses");
+        register_stat(m_cows_cache->s_redirected_fills).name("cows_redirected_fills");
+        register_stat(m_cows_cache->s_tracked_pages, false).name("cows_tracked_pages");
+        register_stat(m_cows_cache->s_distinct_source_rows, false).name("cows_distinct_source_rows");
         register_stat(m_cows_cache->s_misses).name("cows_misses");
         register_stat(m_cows_cache->s_half_misses).name("cows_half_misses");
         register_stat(m_cows_cache->s_hits).name("cows_hits");
@@ -404,6 +407,13 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
         }
         if (m_cows_placement == "same_bank" && m_cows_cache->m_row_shift == 0) {
           throw ConfigurationError("cows_source_placement same_bank: could not locate the row field in the address mapping");
+        }
+        if ((total_rows & (total_rows - 1)) != 0 || (rows & (rows - 1)) != 0) {
+          throw ConfigurationError("CoWs source placement needs power-of-2 row counts (total {}, per bank {})", total_rows, rows);
+        }
+        uint64_t space = m_cows_placement == "same_bank" ? (uint64_t)rows : total_rows;
+        if (m_cows_placement != "self" && m_cows_cache->m_source_pool > space) {
+          throw ConfigurationError("cows_source_pool {} exceeds the {} available source rows", m_cows_cache->m_source_pool, space);
         }
         if (m_cows_placement == "random") {   // linear 4KB-aligned addresses below total_rows x page must cover distinct rows
           auto a = mapv((Addr_t)(total_rows - 1) * m_cows_page_bytes), w = mapv((Addr_t)total_rows * m_cows_page_bytes);

@@ -7,6 +7,7 @@
 #include <bit>
 #include <cassert>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include "base/type.h"
@@ -113,6 +114,7 @@ public:
 
         public:
             Line() : block_map(CoWsCache::AddrParser::getNumBlocksPerPage()) { reset(); }
+            uint64_t touch_order = 0;   // WI-013: order in which the page was first touched (source pool index = order mod pool)
 
             void reset() {
                 valid = false;
@@ -402,11 +404,25 @@ public:
     uint64_t m_total_rows = 0;         // all rows of the memory (channel x rank x bg x bank x row)
     uint64_t m_rows_per_bank = 0;
     uint32_t m_row_shift = 0;          // address bit of the row field (same_bank)
-    uint64_t s_redirected_reads = 0;
+    uint64_t s_redirected_reads = 0;      // all redirected DRAM reads (loads + write-allocate fills)
+    uint64_t s_redirected_fills = 0;      // of which write-allocate fills (PI ruling: fills of unwritten blocks are redirected)
     uint64_t s_unwritten_block_misses = 0;
     uint64_t s_written_block_misses = 0;
-    // called for every request the LLC sends to memory for a miss (fill); may rewrite req.addr (original kept in orig_addr)
-    void maybe_redirect(Request& req);
+    uint64_t s_tracked_pages = 0;         // pages with an entry (= renamed pages when placement != self); whole run
+    uint64_t s_distinct_source_rows = 0;  // distinct source rows read so far; whole run
+    uint64_t m_next_touch = 0;
+    std::unordered_set<uint64_t> m_used_source_rows;
+    // called for every request the LLC sends to memory for a miss; may rewrite req.addr (original kept in orig_addr)
+    void maybe_redirect(Request& req, bool is_fill);
+    // bijection on [0, 2^bits): odd multiplies and xorshifts modulo 2^bits (no two pool indices share a row)
+    static uint64_t permute(uint64_t x, uint32_t bits) {
+        const uint64_t m = (bits >= 64) ? ~0ull : ((1ull << bits) - 1);
+        x &= m;
+        x = (x * 0x9E3779B97F4A7C15ull + 0x632BE59BD9B4E019ull) & m; x ^= x >> (bits / 2 + 1);
+        x = (x * 0xBF58476D1CE4E5B9ull) & m;                          x ^= x >> (bits / 3 + 1);
+        x = (x * 0x94D049BB133111EBull) & m;                          x ^= x >> (bits / 2 + 1);
+        return x;
+    }
     static uint64_t mix64(uint64_t x) {   // splitmix64 finalizer
         x += 0x9E3779B97F4A7C15ull; x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull; x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
         return x ^ (x >> 31);

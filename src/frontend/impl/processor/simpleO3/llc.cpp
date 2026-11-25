@@ -270,7 +270,7 @@ bool SimpleO3LLC::send(Request req) {
     // WI-013: a fill of an unwritten block of a renamed page reads the source row (the MSHR keeps the own address)
     Request to_mem = req;
     if (m_cows_cache != nullptr) {
-      m_cows_cache->maybe_redirect(to_mem);
+      m_cows_cache->maybe_redirect(to_mem, dirty);   // dirty: an L2 writeback that missed = write-allocate fill
     }
     m_miss_list.push_back(std::make_pair(m_clk + m_latency + cows_latency, to_mem));
 

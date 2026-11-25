@@ -137,6 +137,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     std::map<Clk_t, std::array<uint64_t, 3>> m_read_lat_by_class;
     uint64_t s_read_lat_sum_by_class[3] = {0, 0, 0};
     uint64_t s_read_cnt_by_class[3] = {0, 0, 0};
+    uint64_t s_redirect_rowclass[3] = {0, 0, 0};   // WI-013: row outcome of reads redirected to a CoWs source row
 
     void dump_read_latency_by_rowclass() {
       auto of = std::ofstream(m_controller_stats_name + "_read_latency_by_rowclass");
@@ -207,6 +208,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       for (int k = 0; k < 3; k++) {
         register_stat(s_read_lat_sum_by_class[k]).name("read_latency_sum_{}_{}", rc_names[k], m_channel_id);
         register_stat(s_read_cnt_by_class[k]).name("read_count_{}_{}", rc_names[k], m_channel_id);
+        register_stat(s_redirect_rowclass[k]).name("redirected_read_{}_{}", rc_names[k], m_channel_id);
       }
       register_stat(s_avg_read_latency).name("avg_read_latency_{}", m_channel_id);
     };
@@ -386,18 +388,21 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
           s_read_row_hits++;
           s_row_hits++;
           req->row_class = 0;
+          if (req->orig_addr != -1) s_redirect_rowclass[0]++;   // WI-013: read redirected to a CoWs source row
           if (req->source_id != -1)
             s_read_row_hits_per_core[req->source_id]++;
         } else if (is_row_open(req)) {
           s_read_row_conflicts++;
           s_row_conflicts++;
           req->row_class = 2;
+          if (req->orig_addr != -1) s_redirect_rowclass[2]++;   // WI-013: read redirected to a CoWs source row
           if (req->source_id != -1)
             s_read_row_conflicts_per_core[req->source_id]++;
         } else {
           s_read_row_misses++;
           s_row_misses++;
           req->row_class = 1;
+          if (req->orig_addr != -1) s_redirect_rowclass[1]++;   // WI-013: read redirected to a CoWs source row
           if (req->source_id != -1)
             s_read_row_misses_per_core[req->source_id]++;
         }

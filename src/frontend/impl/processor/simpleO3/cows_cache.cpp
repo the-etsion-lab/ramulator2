@@ -254,7 +254,7 @@ void CoWsCache::set_source_index_bits(uint32_t src_index_bits) {
              <<", bytes="<<s_cache_bytes<<std::endl;
 }
 
-void CoWsCache::maybe_redirect(Request& req) {
+void CoWsCache::maybe_redirect(Request& req, bool is_fill) {
     AddrParser ap(req.addr);
     auto it = m_perfect_cache.find(ap.getPageAddr());
     if (it == m_perfect_cache.end()) {
@@ -268,18 +268,29 @@ void CoWsCache::maybe_redirect(Request& req) {
     if (m_placement == Placement::SELF) {
         return;   // today's model: the data is read from the own row
     }
-    uint64_t pool_idx = mix64((uint64_t)ap.getPageNum() ^ 0x5EEDC0DEull) % m_source_pool;
-    uint64_t r = mix64(pool_idx ^ 0xC0FFEEull);
+    // Pool index by first-touch order (pool = #pages -> every page has its own source; pool = #pages/4 -> 4 pages per source),
+    // source row = a fixed permutation of the pool index over all rows (random) or over the bank's rows (same_bank).
+    uint64_t pool_idx = it->second.touch_order % m_source_pool;
     Addr_t src_page;
+    uint64_t row_id;
     if (m_placement == Placement::RANDOM) {
-        src_page = (Addr_t)((r % m_total_rows) << AddrParser::getDramPageBits());   // 4KB-aligned linear address = one row anywhere
+        row_id = permute(pool_idx, std::countr_zero(m_total_rows));
+        src_page = (Addr_t)(row_id << AddrParser::getDramPageBits());   // 4KB-aligned linear address = one row anywhere
     } else {   // SAME_BANK: keep channel/rank/bankgroup/bank, replace the row field
+        uint64_t row = permute(pool_idx, std::countr_zero(m_rows_per_bank));
         Addr_t row_mask = (Addr_t)(m_rows_per_bank - 1) << m_row_shift;
-        src_page = (ap.getPageAddr() & ~row_mask) | (Addr_t)((r % m_rows_per_bank) << m_row_shift);
+        src_page = (ap.getPageAddr() & ~row_mask) | (Addr_t)(row << m_row_shift);
+        row_id = (uint64_t)src_page >> AddrParser::getDramPageBits();
+    }
+    if (m_used_source_rows.insert(row_id).second) {
+        s_distinct_source_rows++;
     }
     req.orig_addr = req.addr;
     req.addr = src_page | (req.addr & AddrParser::getDramPageOffsetMask());
     s_redirected_reads++;
+    if (is_fill) {
+        s_redirected_fills++;
+    }
 }
 
 void CoWsCache::check_pending_lines(Clk_t clk) {
@@ -310,6 +321,8 @@ std::tuple<bool, CoWsCache::Line*> CoWsCache::perfect_cache_lookup(Addr_t page_a
 
         newline.setPageAddr(page_addr);
         newline.setValid(true);
+        newline.touch_order = m_next_touch++;   // WI-013
+        s_tracked_pages++;
 
         line = &newline;
         miss = true;
