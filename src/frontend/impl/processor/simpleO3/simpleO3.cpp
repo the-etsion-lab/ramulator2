@@ -213,7 +213,16 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
         // WI-015
         m_cows_cache->m_table_line_fetch = param<bool>("cows_table_line_fetch")
           .desc("WI-015: a CoWs miss reads the whole 64B table line and installs all its entries.").default_val(false);
+        m_cows_cache->m_entries_per_line = param<uint32_t>("cows_table_entries_per_line")
+          .desc("WI-015: CoWs table entries per 64B table line (PI ruling: 4, tagless 83-b entries).").default_val(4);
+        if (m_cows_cache->m_entries_per_line == 0 || (m_cows_cache->m_entries_per_line & (m_cows_cache->m_entries_per_line - 1)) != 0) {
+          throw ConfigurationError("cows_table_entries_per_line must be a power of 2 (got {})", m_cows_cache->m_entries_per_line);
+        }
         register_stat(m_cows_cache->s_line_fetches).name("cows_line_fetches");
+        register_stat(m_cows_cache->s_line_siblings_present).name("cows_line_siblings_present");
+        register_stat(m_cows_cache->s_line_siblings_dropped).name("cows_line_siblings_dropped");
+        register_stat(m_cows_cache->s_line_sibling_victim_writes).name("cows_line_sibling_victim_writes");
+        register_stat(m_cows_cache->s_prefetch_useful_evictpath).name("cows_prefetch_useful_evictpath");
         register_stat(m_cows_cache->s_line_siblings_installed).name("cows_line_siblings_installed");
         register_stat(m_cows_cache->s_prefetch_useful).name("cows_prefetch_useful");
         register_stat(m_cows_cache->s_prefetch_evicted_unused).name("cows_prefetch_evicted_unused");

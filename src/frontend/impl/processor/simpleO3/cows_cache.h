@@ -116,6 +116,7 @@ public:
             Line() : block_map(CoWsCache::AddrParser::getNumBlocksPerPage()) { reset(); }
             uint64_t touch_order = 0;   // WI-013: order in which the page was first touched (source pool index = order mod pool)
             bool prefetched = false;    // WI-015: installed as a table-line sibling, not yet used or evicted
+            bool prefetched_on_evict = false;   // WI-015 T5: the sibling came with a table read of the dirty-evict path
             int64_t bank_touch_order = -1;   // WI-013 same_bank: first-touch order within the page's own bank (-1: not yet assigned)
 
             void reset() {
@@ -317,10 +318,11 @@ public:
         public:
         // WI-015 (ported from diag/q05-sectored dd6eebe): install an entry fetched with another entry's table line;
         // false if already present or no ready victim (in-flight entries are never evicted)
-        bool install(CacheSet_t& set, Line* page) const {
-            if(find_in_set(set, page->getTag()) != set.end()) return false;
+        // returns 0 installed, 1 already present, 2 dropped (no ready victim)
+        int install(CacheSet_t& set, Line* page) const {
+            if(find_in_set(set, page->getTag()) != set.end()) return 1;
             auto [it, ev] = alloc_line(set, page);
-            return it != set.end();
+            return it != set.end() ? 0 : 2;
         }
         static void dump_set(const CacheSet_t& set, Addr_t page_addr, const std::string &s) {
             printf("%s[dump_set]: page_addr=0x%lx, set.size=%zu\n", s.c_str(), (unsigned long)page_addr, set.size());
@@ -426,12 +428,16 @@ public:
     uint64_t s_tracked_pages = 0;         // pages with an entry (= renamed pages when placement != self); whole run
     // WI-015: table-line fetch - one table read brings the whole 64B table line (entries_per_line entries of consecutive pages)
     bool m_table_line_fetch = false;
-    uint32_t m_entries_per_line = 1;      // floor(512 / entry bits), set with the entry size at the first tick
+    uint32_t m_entries_per_line = 4;      // cows_table_entries_per_line (PI ruling T1: tagless 83-b table entries, 4 per 64B line)
     uint64_t s_line_fetches = 0;          // real table reads with line fetch on
     uint64_t s_line_siblings_installed = 0;
+    uint64_t s_line_siblings_present = 0; // T3: sibling already in the CoWs cache
+    uint64_t s_line_siblings_dropped = 0; // T3: no ready victim in the sibling's set
+    uint64_t s_line_sibling_victim_writes = 0;   // T2: dirty entries evicted by sibling installs (table writes)
     uint64_t s_prefetch_useful = 0;       // a sibling's first later lookup was a hit or half-miss (a table read avoided)
+    uint64_t s_prefetch_useful_evictpath = 0;    // T5: of which the sibling was fetched by an evict-path table read
     uint64_t s_prefetch_evicted_unused = 0;
-    void fetch_line_siblings(Addr_t page_num, Clk_t ready_clk);
+    void fetch_line_siblings(Addr_t page_num, Clk_t ready_clk, bool on_evict);
     uint64_t s_distinct_source_rows = 0;  // distinct source rows read so far; whole run
     uint64_t m_next_touch = 0;
     std::unordered_set<uint64_t> m_used_source_rows;
