@@ -210,6 +210,13 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
         register_stat(m_cows_cache->s_unwritten_block_misses).name("cows_unwritten_block_misses");
         register_stat(m_cows_cache->s_written_block_misses).name("cows_written_block_misses");
         register_stat(m_cows_cache->s_redirected_fills).name("cows_redirected_fills");
+        // WI-015
+        m_cows_cache->m_table_line_fetch = param<bool>("cows_table_line_fetch")
+          .desc("WI-015: a CoWs miss reads the whole 64B table line and installs all its entries.").default_val(false);
+        register_stat(m_cows_cache->s_line_fetches).name("cows_line_fetches");
+        register_stat(m_cows_cache->s_line_siblings_installed).name("cows_line_siblings_installed");
+        register_stat(m_cows_cache->s_prefetch_useful).name("cows_prefetch_useful");
+        register_stat(m_cows_cache->s_prefetch_evicted_unused).name("cows_prefetch_evicted_unused");
         register_stat(m_cows_cache->s_tracked_pages, false).name("cows_tracked_pages");
         register_stat(m_cows_cache->s_distinct_source_rows, false).name("cows_distinct_source_rows");
         register_stat(m_cows_cache->s_misses).name("cows_misses");

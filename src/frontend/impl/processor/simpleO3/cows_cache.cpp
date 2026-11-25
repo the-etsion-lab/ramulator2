@@ -248,6 +248,10 @@ void CoWsCache::set_source_index_bits(uint32_t src_index_bits) {
     s_src_index_bits = src_index_bits;
     s_entry_bits = Line::getTagBits() + src_index_bits + 1 + AddrParser::getNumBlocksPerPage();
     s_cache_bytes = ((uint64_t)m_nsets * m_assoc * s_entry_bits + 7) / 8;
+    m_entries_per_line = std::max<uint64_t>(1, 512 / s_entry_bits);   // WI-015: entries per 64B table line
+    if (m_table_line_fetch) {
+        std::cerr << "# COWs table-line fetch: " << m_entries_per_line << " entries per 64B table line (" << s_entry_bits << " b/entry)" << std::endl;
+    }
     std::cerr<<"# COWs cache: entry bits="<<s_entry_bits
              <<" (tag+valid+dirty="<<Line::getTagBits()<<", src row index="<<src_index_bits<<", src valid=1"
              <<", bitmap="<<AddrParser::getNumBlocksPerPage()<<"), entries="<<(uint64_t)m_nsets * m_assoc
@@ -305,6 +309,25 @@ void CoWsCache::maybe_redirect(Request& req, bool is_fill) {
     s_redirected_reads++;
     if (is_fill) {
         s_redirected_fills++;
+    }
+}
+
+void CoWsCache::fetch_line_siblings(Addr_t page_num, Clk_t ready_clk) {
+    // WI-015: the table read returned the whole 64B line = entries of pages [base, base + entries_per_line); install the others in their
+    // own sets with the same ready time. Rename-independent (always the whole line).
+    s_line_fetches++;
+    Addr_t base = page_num - page_num % (Addr_t)m_entries_per_line;
+    for(Addr_t q = base; q < base + (Addr_t)m_entries_per_line; q++) {
+        if(q == page_num) continue;
+        auto [pm, sib] = perfect_cache_lookup(q << AddrParser::getDramPageBits());
+        auto& sset = m_cache_sets[(uint32_t)(q & AddrParser::getSetMask())];
+        if(m_policy->install(sset, sib)) {
+            sib->setWhenReady(ready_clk);
+            sib->setPending(true);
+            m_pending_lines.push_back(sib);
+            sib->prefetched = true;
+            s_line_siblings_installed++;
+        }
     }
 }
 
@@ -383,6 +406,10 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_hit(Addr_t baddr, bool is_write,
         return {true, 0, true};
     }
     s_cows_cycles_self += m_access_latency;   // WI-004 C2: handled lookups only
+    if(!cows_cache_miss && page->prefetched) {   // WI-015: the sibling fetched with a table line saved a table read
+        page->prefetched = false;
+        s_prefetch_useful++;
+    }
     if(m_always_miss) {
         cows_cache_miss = true;
     }
@@ -422,6 +449,9 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_hit(Addr_t baddr, bool is_write,
         page->setWhenReady(clk + latency);
         page->setPending(true);
         m_pending_lines.push_back(page);
+        if(m_table_line_fetch) {   // WI-015
+            fetch_line_siblings(page_num, clk + latency);
+        }
     }
     else {
         ++s_hits;
@@ -464,6 +494,10 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_miss(Addr_t baddr, bool is_write
         return {true, 0, true}; // treat it as a miss, but return the latency of just accessing the cows cache. The caller should retry this access later.
     }
     s_cows_cycles_self += m_access_latency;   // WI-004 C2: handled lookups only
+    if(!cows_cache_miss && page->prefetched) {   // WI-015: the sibling fetched with a table line saved a table read
+        page->prefetched = false;
+        s_prefetch_useful++;
+    }
     if(m_always_miss) {
         cows_cache_miss = true;
     }
@@ -503,6 +537,9 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_miss(Addr_t baddr, bool is_write
         page->setWhenReady(clk + latency);
         page->setPending(true);
         m_pending_lines.push_back(page);
+        if(m_table_line_fetch) {   // WI-015
+            fetch_line_siblings(page_num, clk + latency);
+        }
     }
     else {
         ++s_hits;
@@ -550,6 +587,10 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_evict(Addr_t baddr, bool evict_d
         return {true, latency, true};
     }
     s_cows_cycles_self += m_access_latency;   // WI-004 C2: handled lookups only
+    if(!cows_cache_miss && page->prefetched) {   // WI-015: the sibling fetched with a table line saved a table read
+        page->prefetched = false;
+        s_prefetch_useful++;
+    }
     if(m_always_miss) {
         cows_cache_miss = true;
     }
@@ -586,6 +627,9 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_evict(Addr_t baddr, bool evict_d
         page->setWhenReady(clk + latency);
         page->setPending(true);
         m_pending_lines.push_back(page);
+        if(m_table_line_fetch) {   // WI-015
+            fetch_line_siblings(page_num, clk + latency);
+        }
     }
     else {
         ++s_hits;
