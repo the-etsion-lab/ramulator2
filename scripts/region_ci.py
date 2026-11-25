@@ -7,7 +7,8 @@ Method:
   - The measured window of a run is instructions [warmup, num_expected_insts) of every core (warmup = warmup_insts, or
     warmup_percent x num_expected_insts if warmup_insts is 0), i.e. the region [a, b) of run.sh's R<a>-<b>.
   - coreN_ipc_stats holds one (cycle, IPC) sample per ~1M retired instructions; sample k covers instructions (k, k+1] x 1M.
-    The samples of the window are split into 10 equal groups (fewer, >= 5, if the window has < 10 samples); interval IPC of a core = sum(insts) / sum(cycles); interval IPC of
+    The samples of the window are split into 10 groups of one common size g for every core of both runs (g = shortest per-core
+    window // 10; fewer intervals, >= 5, if a window has < 10 samples), so paired intervals cover the same instructions; interval IPC of a core = sum(insts) / sum(cycles); interval IPC of
     the run = mean over cores (the per-core-mean IPC of EXP-01).
   - IPC: mean over intervals and 95% CI half-width t(0.975, n-1) x sd / sqrt(n).
   - Ratio vs baseline (same benchmark, same region, same instruction intervals): per-interval ratio, mean, 95% CI.
@@ -36,9 +37,10 @@ def truncated(d):
     return len(z) > 0 or "MemorySystem:" not in t
 
 
-def interval_ipc(d, n_iv):
+def windows(d):
+    """per core: list of (insts, cycles) of the 1M-instruction samples inside the measured window [warmup, N)"""
     N, W, _ = cfg(d)
-    per_core = []
+    out = []
     c = 0
     while os.path.exists(os.path.join(d, f"core{c}_ipc_stats")):
         smp = [tuple(map(float, l.split()[:2])) for l in open(os.path.join(d, f"core{c}_ipc_stats"))
@@ -46,16 +48,22 @@ def interval_ipc(d, n_iv):
         rec, prev = [], 0.0
         for cyc, ipc in smp:
             rec.append((ipc * (cyc - prev), cyc - prev)); prev = cyc
-        lo, hi = math.ceil(W / 1e6), int(N // 1e6)
-        win = rec[lo:hi]
-        n_iv = min(n_iv, len(win))   # short windows (smoke tests): one 1M-instruction sample per interval
-        if n_iv < 5:
-            raise SystemExit(f"{d}: core {c} has {len(win)} 1M-instruction samples in the window; at least 5 are needed")
-        g = len(win) // n_iv
-        per_core.append([sum(i for i, _ in win[k*g:(k+1)*g]) / sum(cy for _, cy in win[k*g:(k+1)*g]) for k in range(n_iv)])
+        out.append(rec[math.ceil(W / 1e6):int(N // 1e6)])
         c += 1
-    n = min(len(core) for core in per_core)
-    return [S.mean(core[k] for core in per_core) for k in range(n)]
+    return out
+
+
+def interval_ipc(wins, n_iv, g):
+    """interval k of every core = its samples [k*g, (k+1)*g) - one common group size g for all cores (and both runs)"""
+    return [S.mean(sum(i for i, _ in w[k*g:(k+1)*g]) / sum(cy for _, cy in w[k*g:(k+1)*g]) for w in wins) for k in range(n_iv)]
+
+
+def common_group(win_sets, n_iv):
+    m = min(len(w) for wins in win_sets for w in wins)
+    n_iv = min(n_iv, m)   # short windows (smoke tests): one 1M-instruction sample per interval
+    if n_iv < 5:
+        raise SystemExit(f"only {m} 1M-instruction samples in the shortest per-core window; at least 5 are needed")
+    return n_iv, m // n_iv
 
 
 def ci(v):
@@ -74,14 +82,17 @@ def main():
     if "--header" in sys.argv:
         print(",".join(cols))
     r = {"run": run, "region_start": skip + W, "region_end": skip + N, "trunc": bool(truncated(run) or (base and truncated(base)))}
-    iv = interval_ipc(run, n_iv)
+    wr = windows(run)
+    wb = windows(base) if base else None
+    if base and cfg(base) != (N, W, skip):
+        raise SystemExit(f"baseline region {cfg(base)} != run region {(N, W, skip)}")
+    n_iv, g = common_group([wr] + ([wb] if wb else []), n_iv)
+    iv = interval_ipc(wr, n_iv, g)
     r["ipc_mean"], r["ipc_ci95"] = ci(iv)
     r["n_intervals"] = len(iv)
     if base:
-        if cfg(base) != (N, W, skip):
-            raise SystemExit(f"baseline region {cfg(base)} != run region {(N, W, skip)}")
-        bv = interval_ipc(base, n_iv)
-        n = min(len(iv), len(bv))
+        bv = interval_ipc(wb, n_iv, g)
+        n = n_iv
         m, h = ci([x / y for x, y in zip(iv[:n], bv[:n])])
         r["interval_ratios"] = ";".join(f"{x / y:.4f}" for x, y in zip(iv[:n], bv[:n]))
         r.update(base_ipc_mean=S.mean(bv), ratio_mean=m, ratio_ci_low=m - h, ratio_ci_high=m + h,
