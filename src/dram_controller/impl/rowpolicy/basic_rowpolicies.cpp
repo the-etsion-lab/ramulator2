@@ -187,7 +187,7 @@ class CloseAdaptiveRowPolicy : public IRowPolicy, public Implementation {
     uint64_t s_close_nohit_pre = 0, s_close_cap_pre = 0;   // closed with a fallback PRE
     uint64_t s_fallback_marked = 0, s_fallback_cancelled = 0;
     uint64_t s_keep_open = 0, s_keep_open_wronly = 0;      // wronly: only WRITE-buffer requests kept a read's row open (review K3)
-    uint64_t s_fallback_pre_wait_cycles = 0;               // sum over fallback PREs of (issue - enqueue) ticks (review K1)
+    uint64_t s_fallback_pre_wait_cycles = 0;               // sum over fallback PREs of (issue - enqueue - 1) ticks (review K1)
     uint64_t s_max_accesses_per_act = 0;
     uint64_t s_other_closes = 0;                           // closes by PRE/PREA/REF of other origin (conflicts, refresh)
 
@@ -213,7 +213,7 @@ class CloseAdaptiveRowPolicy : public IRowPolicy, public Implementation {
     void reset_bank(int fb, bool counted_close) {   // the bank's row closed by a command we did not convert
       BankState& b = m_banks[fb];
       if (b.close_pending && b.pre_sent) {          // our fallback PRE (or a PREA/REF that closed the bank first)
-        s_fallback_pre_wait_cycles += m_tick - b.pre_sent_tick;
+        s_fallback_pre_wait_cycles += m_tick - b.pre_sent_tick - 1;   // 0 = issued at the first tick after it was enqueued
         if (b.pending_cap) s_close_cap_pre++; else s_close_nohit_pre++;
       } else if (b.close_pending) {
         s_fallback_cancelled++;                     // closed by someone else before our PRE was legal
