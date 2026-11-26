@@ -289,6 +289,22 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       return false;
     }
 
+    int pending_requests_to_row(const AddrVec_t& addr_vec, const Request* exclude) override {   // WI-017
+      int row_idx = m_dram->m_levels("row");
+      auto match = [&](const Request& r) {
+        if (&r == exclude) return false;
+        for (int i = 0; i <= row_idx; i++)
+          if (r.addr_vec[i] != addr_vec[i] && r.addr_vec[i] != -1 && addr_vec[i] != -1) return false;
+        return true;
+      };
+      int m = 0;
+      for (auto& r : m_read_buffer)  if (match(r)) { m |= PENDING_READ; break; }
+      for (auto& r : m_write_buffer) if (match(r)) { m |= PENDING_WRITE; break; }
+      for (auto& r : m_active_buffer)
+        if (match(r)) m |= (r.type_id == Request::Type::Write) ? PENDING_ACTIVE_WRITE : PENDING_ACTIVE_READ;
+      return m;
+    }
+
     bool priority_send(Request& req) override {
       req.final_command = m_dram->m_request_translations(req.type_id);
 

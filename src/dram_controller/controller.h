@@ -51,6 +51,13 @@ class IDRAMController : public Clocked<IDRAMController> {
     virtual bool other_active_request_in_bank(const ReqBuffer::iterator& req_it) { return false; };
 
     /**
+     * @brief       WI-017: which buffers hold a request (other than *exclude) to the same channel/rank/bankgroup/bank/ROW as
+     *              addr_vec. Bit mask of PENDING_* (0 = none). Default 0: only GenericDRAMController implements it.
+     */
+    static constexpr int PENDING_READ = 1, PENDING_WRITE = 2, PENDING_ACTIVE_READ = 4, PENDING_ACTIVE_WRITE = 8;
+    virtual int pending_requests_to_row(const AddrVec_t& addr_vec, const Request* exclude) { return 0; };
+
+    /**
      * @brief       Ticks the memory controller.
      * 
      */
