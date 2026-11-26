@@ -190,6 +190,10 @@ class CloseAdaptiveRowPolicy : public IRowPolicy, public Implementation {
     uint64_t s_fallback_pre_wait_cycles = 0;               // sum over fallback PREs of (issue - enqueue - 1) ticks (review K1)
     uint64_t s_max_accesses_per_act = 0;
     uint64_t s_other_closes = 0;                           // closes by PRE/PREA/REF of other origin (conflicts, refresh)
+    uint64_t s_over_cap_fallback = 0;   // accesses beyond the cap while the bank was close-pending (hit served before the PRE was legal)
+    uint64_t s_over_cap_other = 0;      // accesses beyond the cap otherwise (must stay 0)
+    uint64_t s_stale_pre = 0;           // our close-row PRE issued after the bank's mark was cleared (a REF/PREA/conflict PRE closed
+                                        // it first): it closes a re-opened row or hits a closed bank (review, should be ~0)
 
     int flat_bank(const AddrVec_t& a) const {
       return a[m_bank_level] + a[m_bankgroup_level] * m_num_banks + a[m_rank_level] * m_num_banks * m_num_bankgroups;
@@ -263,6 +267,9 @@ class CloseAdaptiveRowPolicy : public IRowPolicy, public Implementation {
       register_stat(s_fallback_pre_wait_cycles).name("ca_fallback_pre_wait_cycles");
       register_stat(s_max_accesses_per_act).name("ca_max_accesses_per_act");
       register_stat(s_other_closes).name("ca_other_closes");
+      register_stat(s_over_cap_fallback).name("ca_over_cap_fallback");
+      register_stat(s_over_cap_other).name("ca_over_cap_other");
+      register_stat(s_stale_pre).name("ca_stale_pre");
     };
 
     void update(bool request_found, ReqBuffer::iterator& req_it) override {
@@ -274,6 +281,10 @@ class CloseAdaptiveRowPolicy : public IRowPolicy, public Implementation {
         const auto& meta = m_dram->m_command_meta(req_it->command);
         auto& a = req_it->addr_vec;
         if (meta.is_closing || meta.is_refreshing) {
+          if (req_it->type_id == m_PRE_req_id && a[m_bankgroup_level] != -1 && a[m_bank_level] != -1) {   // our fallback PRE
+            const BankState& b = m_banks[flat_bank(a)];
+            if (!(b.close_pending && b.pre_sent)) s_stale_pre++;
+          }
           if (a[m_bankgroup_level] == -1 && a[m_bank_level] == -1) {          // all-bank close (PREA/REFab)
             for (int fb = 0; fb < m_num_banks * m_num_bankgroups; fb++)
               reset_bank(fb + a[m_rank_level] * m_num_banks * m_num_bankgroups, true);
@@ -290,6 +301,7 @@ class CloseAdaptiveRowPolicy : public IRowPolicy, public Implementation {
           int fb = flat_bank(a);
           BankState& b = m_banks[fb];
           issued_bank = fb;
+          if ((int)b.accesses >= m_cap) { if (b.close_pending) s_over_cap_fallback++; else s_over_cap_other++; }
           b.close_pending = false; b.pre_sent = false;   // a new access to the row decides again
           s_accesses++;
           b.accesses++;
