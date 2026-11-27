@@ -307,7 +307,7 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
         }
         m_llc_carveout_applied = true;
         std::cerr << "# LLC carve-out without CoWs: llc_carveout_lines=" << m_llc_carveout_lines << std::endl;
-        m_llc->set_carveout(m_llc_carveout_lines, "lines", m_cows_carveout_layout, (int64_t)(m_cows_page_bytes / m_llc_linesize_bytes));
+        m_llc->set_carveout(m_llc_carveout_lines, "lines", m_cows_carveout_layout, carve_group_sets());
       }
 
       if(m_clk % 1000000 == 0) {
@@ -419,7 +419,38 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
       std::cerr << "# CoWs carve-out: cows bytes=" << m_cows_cache->s_cache_bytes << ", exact lines=" << lines_bytes
                 << ", physical lines (" << m_cows_cache->get_num_sets() << " sets x " << lines_per_cows_set << ")=" << lines_physical
                 << ", mode " << m_cows_carveout << " -> carve " << lines << " lines" << std::endl;
-      m_llc->set_carveout(lines, m_cows_carveout, m_cows_carveout_layout, (int64_t)(m_cows_page_bytes / m_llc_linesize_bytes));
+      m_llc->set_carveout(lines, m_cows_carveout, m_cows_carveout_layout, carve_group_sets());
+    }
+
+    // WI-018: LLC lines per DRAM row from the address mapping: the smallest power-of-2 number of consecutive lines k such that line k
+    // maps to a different channel/rank/bankgroup/bank/row than line 0 (RoBaRaChCo: 64 = a 4KB row). Independent of dram_page_bytes,
+    // which no-CoWs configs leave at 8KB (it only sets the ASLR page offset there).
+    int64_t llc_lines_per_dram_row() {
+      IDRAM* dram = m_memory_system->get_dram();
+      IAddrMapper* mapper = m_memory_system->get_addr_mapper();
+      if (dram == nullptr || mapper == nullptr) {
+        throw ConfigurationError("page_aligned carve-out needs the DRAM and the address mapper to find the row size");
+      }
+      int row_level = dram->m_levels("row");
+      auto mapv = [&](Addr_t a) { Request r(a, Request::Type::Read); mapper->apply(r); return r.addr_vec; };
+      auto z = mapv(0);
+      for (int64_t k = 1; k <= (1 << 20); k *= 2) {
+        auto v = mapv((Addr_t)k * m_llc_linesize_bytes);
+        for (int l = 0; l <= row_level; l++) {
+          if (v[l] != z[l]) return k;
+        }
+      }
+      throw ConfigurationError("could not find the DRAM row size in the address mapping");
+    }
+
+    int64_t carve_group_sets() {   // P for the carve-out layout (only used by page_aligned)
+      if (m_cows_carveout_layout != "page_aligned") return 0;
+      int64_t p = llc_lines_per_dram_row();
+      if (m_cows_cache != nullptr && (int64_t)(m_cows_page_bytes / m_llc_linesize_bytes) != p) {
+        throw ConfigurationError("page_aligned: dram_page_bytes / linesize = {} but the DRAM row holds {} LLC lines",
+                                 m_cows_page_bytes / m_llc_linesize_bytes, p);
+      }
+      return p;
     }
 
     void check_cows_page_geometry(IMemorySystem* memory_system) {
