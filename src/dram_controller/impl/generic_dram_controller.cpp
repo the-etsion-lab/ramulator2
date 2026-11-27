@@ -122,7 +122,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     bool m_pick_bypass = false;   // this tick's request was chosen by the bypass branch
     uint64_t s_drain_bypasses = 0, s_drain_bypass_pre = 0, s_drain_bypass_act = 0;   // review D2: bypasses whose command is PRE / ACT
     uint64_t s_drain_blocked_cap = 0, s_drain_blocked_k = 0;
-    uint64_t s_drain_bypass_vetoed = 0;   // bypass picks vetoed by the 2.3 closing check (the tick issues nothing)
+    uint64_t s_drain_bypass_vetoed = 0;
+    uint64_t s_prio_blocked_ticks = 0, s_prio_blocked_demand_ticks = 0;   // WI-026 review D2: ticks lost to a not-ready priority head   // bypass picks vetoed by the 2.3 closing check (the tick issues nothing)
     uint64_t s_write_refusals = 0, s_write_buffer_hwm = 0, s_write_lat_sum = 0, s_writes_issued = 0;   // review D1, write latency
 
     std::string m_controller_stats_name;
@@ -272,6 +273,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       register_stat(s_read_queue_len).name("read_queue_len_{}", m_channel_id);
       register_stat(s_write_queue_len).name("write_queue_len_{}", m_channel_id);
       register_stat(s_priority_queue_len).name("priority_queue_len_{}", m_channel_id);
+      register_stat(s_prio_blocked_ticks).name("priority_head_blocked_ticks_{}", m_channel_id);   // WI-026 review D2
+      register_stat(s_prio_blocked_demand_ticks).name("priority_head_blocked_demand_ticks_{}", m_channel_id);
       register_stat(s_queue_len_avg).name("queue_len_avg_{}", m_channel_id);
       register_stat(s_read_queue_len_avg).name("read_queue_len_avg_{}", m_channel_id);
       register_stat(s_write_queue_len_avg).name("write_queue_len_avg_{}", m_channel_id);
@@ -739,6 +742,9 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
 
           request_found = m_dram->check_ready(req_it->command, req_it->addr_vec);
           if (!request_found & m_priority_buffer.size() != 0) {
+            // WI-026 review D2 (stats only): the not-ready priority head (REFab / its PREA) blocks the whole channel this tick
+            s_prio_blocked_ticks++;
+            if (m_read_buffer.size() + m_write_buffer.size() != 0) s_prio_blocked_demand_ticks++;
             return false;
           }
         }
