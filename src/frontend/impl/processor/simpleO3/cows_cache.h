@@ -13,9 +13,14 @@
 
 #include "base/type.h"
 #include "base/request.h"
+#include <memory>
+#include <limits>
+#include <map>
 #include "base/debug.h"
 
 namespace Ramulator {
+
+class IMemorySystem;   // WI-019
 
 template<class T>
 static bool is_power_of_2(T val) {
@@ -83,9 +88,24 @@ public:
         const Addr_t m_addr;
     };
 
+    class Line;
+    // WI-019: one in-flight table-line READ (cows_table_access: real). All entries that need that 64B table line wait on it: the demand
+    // entry, its line-fetch siblings, later misses/half-misses on them, the C1 evict update and the LLC requests that depend on them.
+    struct TableToken {
+        bool done = false;
+        Clk_t done_clk = 0;
+        Clk_t created_clk = 0;      // end-to-end latency = done_clk - created_clk (incl. back-pressure wait before the controller)
+        std::vector<Line*> lines;   // CoWs entries made ready at completion (only if their tok is still this token)
+        uint32_t waiters = 0;       // LLC requests (fills / writebacks) that waited on it
+    };
+    using TokenPtr = std::shared_ptr<TableToken>;
+    static constexpr Clk_t NOT_READY = std::numeric_limits<Clk_t>::max() / 4;   // whenReady of an entry whose table read is in flight
+
     class Line {
         public:
         static const uint32_t PHYS_ADDRESS_SPACE_BITS = 52; // ARMv8.2 supports a 52b physical address space
+        TokenPtr tok;   // WI-019: the table read this entry waits on (real mode); null in fixed mode
+        Addr_t pageAddr() const { return page_phys_addr; }   // WI-019
         static uint64_t bytes_per_line;
 
         static inline uint32_t getDataBitSize() {
@@ -301,6 +321,8 @@ public:
                 if(victim->isDirty()) {
                     victim->setDirty(false);
                     m_cows_cache->s_table_writes++;
+                    if (m_cows_cache->m_real_table)   // WI-019: a real masked WRITE of the victim's table line
+                        m_cows_cache->table_write(victim->pageAddr() >> AddrParser::getDramPageBits());
                 }
 
                 m_cows_cache->s_evicts++;
@@ -499,6 +521,39 @@ public:
     uint32_t get_access_latency() { return m_access_latency; }
 
     void check_pending_lines(Clk_t clk);
+
+    // WI-019: table reads and writes as real DRAM requests (cows_table_access: real). All of it is inert in fixed mode.
+    bool m_real_table = false;
+    int m_table_region = -1;        // R: the table occupies physical address bits 31-38 == R (2GB = 1024 rows in every bank)
+    Clk_t m_now = 0;                // LLC clock of the last tick (completion time of table reads)
+    TokenPtr m_last_token;          // set by llc_miss / llc_evict for the LLC request they returned (take_last_token)
+    std::unordered_map<Addr_t, TokenPtr> m_pending_table;   // table line address -> in-flight read
+    std::list<Request> m_table_queue;                        // table requests not yet accepted by the memory system
+    uint64_t s_table_tokens = 0, s_table_token_joins = 0, s_table_read_retries = 0, s_table_write_retries = 0;
+    uint64_t s_table_writes_issued = 0, s_src_rows_moved = 0, s_data_in_table_region = 0;
+    std::map<uint32_t, uint64_t> m_token_waiters_hist;      // LLC waiters per completed token (review R6)
+    uint64_t s_table_reads_done = 0, s_table_read_e2e_sum = 0, s_token_waiters_sum = 0;
+    float s_table_read_e2e_mean = 0, s_token_waiters_mean = 0;
+    static constexpr Addr_t PHYS_MASK = (((Addr_t)1) << 39) - 1;   // the 39-bit DRAM physical space (RoBaRaChCo ignores higher bits)
+    bool m_table_interleaved = false;   // cows_table_layout: flat (false) | interleaved (true)
+    // Table line i = ppn >> 2 (4 consecutive pages, WI-015) of the 2GB table in region R (16B entry per 4KB frame, 4 per 64B line):
+    //  flat:        addr = R<<31 | 64*i, through the normal mapper (a contiguous OS-reserved region; a table row = 64 lines = 256 pages)
+    //  interleaved: ch = i&7, j = i>>3, addr = R<<31 | (j>>6)<<15 | (i&7)<<12 | (j&63)<<6 (consecutive lines rotate over the channels;
+    //               rows advance through rank/bankgroup/bank). Same region, same 1024 rows per bank; a pure index permutation.
+    Addr_t table_line_addr(Addr_t page_num) const {
+        Addr_t i = (((page_num << 12) & PHYS_MASK) >> 12) >> 2;
+        Addr_t base = (Addr_t)m_table_region << 31;
+        if (!m_table_interleaved) return base | (i << 6);
+        Addr_t j = i >> 3;
+        return base | ((j >> 6) << 15) | ((i & 7) << 12) | ((j & 63) << 6);
+    }
+    bool in_table_region(Addr_t addr) const { return m_real_table && (int)((addr & PHYS_MASK) >> 31) == m_table_region; }
+    TokenPtr table_read(Addr_t page_num, bool demand);
+    void table_attach(Line* line, const TokenPtr& t);
+    void table_write(Addr_t page_num);
+    void issue_table_requests(IMemorySystem* ms);
+    TokenPtr take_last_token() { TokenPtr t = std::move(m_last_token); m_last_token.reset(); return t; }
+    void count_data_addr(Addr_t addr) { if (in_table_region(addr)) s_data_in_table_region++; }
 private:
     void track_misses(Clk_t clk, int total_llc_misses) {
         static Clk_t last_print = 0;
