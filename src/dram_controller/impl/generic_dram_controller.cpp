@@ -123,7 +123,14 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     uint64_t s_drain_bypasses = 0, s_drain_bypass_pre = 0, s_drain_bypass_act = 0;   // review D2: bypasses whose command is PRE / ACT
     uint64_t s_drain_blocked_cap = 0, s_drain_blocked_k = 0;
     uint64_t s_drain_bypass_vetoed = 0;
-    uint64_t s_prio_blocked_ticks = 0, s_prio_blocked_demand_ticks = 0;   // WI-026 review D2: ticks lost to a not-ready priority head   // bypass picks vetoed by the 2.3 closing check (the tick issues nothing)
+    uint64_t s_prio_blocked_ticks = 0, s_prio_blocked_demand_ticks = 0;
+    // WI-026 diagnostic (stats only): read-buffer pressure while some rank of this channel is in all-bank refresh (REFab issued
+    // < nRFC1 ago, tracked from issued commands) vs not.
+    std::vector<Clk_t> m_ref_end;   // per rank
+    int m_cmd_refab = -1;
+    uint64_t s_rd_ref_ticks = 0, s_rd_occ_ref = 0, s_rd_occ_noref = 0, s_rd_full_ref = 0, s_rd_full_noref = 0;
+    uint64_t s_rd_on_ref_rank = 0;   // sum over ticks of reads in the read buffer that target a rank in refresh
+    uint64_t s_rd_refused_ref = 0, s_rd_refused_noref = 0;   // WI-026 review D2: ticks lost to a not-ready priority head   // bypass picks vetoed by the 2.3 closing check (the tick issues nothing)
     uint64_t s_write_refusals = 0, s_write_buffer_hwm = 0, s_write_lat_sum = 0, s_writes_issued = 0;   // review D1, write latency
 
     std::string m_controller_stats_name;
@@ -224,7 +231,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     void setup(IFrontEnd* frontend, IMemorySystem* memory_system) override {
       m_dram = memory_system->get_ifce<IDRAM>();
       m_bank_addr_idx = m_dram->m_levels("bank");
-      m_rank_idx = m_dram->m_levels("rank"); m_cmd_act = m_dram->m_commands("ACT"); m_cmd_rd = m_dram->m_commands("RD");   // WI-022
+      m_rank_idx = m_dram->m_levels("rank");
+      m_cmd_refab = m_dram->m_commands("REFab"); m_ref_end.assign(m_dram->get_level_size("rank"), -1);   // WI-026 diagnostic m_cmd_act = m_dram->m_commands("ACT"); m_cmd_rd = m_dram->m_commands("RD");   // WI-022
 
       m_auto_precharge = param<bool>("auto_precharge")
         .desc("Strict closed-row: serve every read/write with RDA/WRA (auto-precharge).").default_val(false);
@@ -275,6 +283,14 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       register_stat(s_priority_queue_len).name("priority_queue_len_{}", m_channel_id);
       register_stat(s_prio_blocked_ticks).name("priority_head_blocked_ticks_{}", m_channel_id);   // WI-026 review D2
       register_stat(s_prio_blocked_demand_ticks).name("priority_head_blocked_demand_ticks_{}", m_channel_id);
+      register_stat(s_rd_ref_ticks).name("refdiag_ticks_rank_in_refresh_{}", m_channel_id);   // WI-026 diagnostic
+      register_stat(s_rd_occ_ref).name("refdiag_rdbuf_occ_sum_refresh_{}", m_channel_id);
+      register_stat(s_rd_occ_noref).name("refdiag_rdbuf_occ_sum_norefresh_{}", m_channel_id);
+      register_stat(s_rd_full_ref).name("refdiag_rdbuf_full_ticks_refresh_{}", m_channel_id);
+      register_stat(s_rd_full_noref).name("refdiag_rdbuf_full_ticks_norefresh_{}", m_channel_id);
+      register_stat(s_rd_on_ref_rank).name("refdiag_rd_on_refreshing_rank_sum_{}", m_channel_id);
+      register_stat(s_rd_refused_ref).name("refdiag_read_refusals_refresh_{}", m_channel_id);
+      register_stat(s_rd_refused_noref).name("refdiag_read_refusals_norefresh_{}", m_channel_id);
       register_stat(s_queue_len_avg).name("queue_len_avg_{}", m_channel_id);
       register_stat(s_read_queue_len_avg).name("read_queue_len_avg_{}", m_channel_id);
       register_stat(s_write_queue_len_avg).name("write_queue_len_avg_{}", m_channel_id);
@@ -395,6 +411,10 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         // We could not enqueue the request
         req.arrive = -1;
         if (m_cows_table && req.type_id == Request::Type::Write) s_write_refusals++;   // WI-021 review D1
+        if (req.type_id == Request::Type::Read) {   // WI-026 diagnostic
+          bool ref = false; for (Clk_t e : m_ref_end) ref |= m_clk < e;
+          if (ref) s_rd_refused_ref++; else s_rd_refused_noref++;
+        }
         return false;
       }
       if (m_cows_table && req.type_id == Request::Type::Write)   // WI-021: write-buffer high-water mark
@@ -456,6 +476,18 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       s_write_queue_len += m_write_buffer.size();
       s_priority_queue_len += m_priority_buffer.size();
 
+      {   // WI-026 diagnostic (stats only)
+        bool ref = false;
+        for (Clk_t e : m_ref_end) ref |= m_clk < e;
+        if (ref) {
+          s_rd_ref_ticks++; s_rd_occ_ref += m_read_buffer.size();
+          if (m_read_buffer.size() > m_read_buffer.max_size) s_rd_full_ref++;   // full = capacity max_size + 1 (ReqBuffer::enqueue)
+          for (auto& r : m_read_buffer) { int rk = r.addr_vec[m_rank_idx]; if (rk >= 0 && m_clk < m_ref_end[rk]) s_rd_on_ref_rank++; }
+        } else {
+          s_rd_occ_noref += m_read_buffer.size();
+          if (m_read_buffer.size() > m_read_buffer.max_size) s_rd_full_noref++;
+        }
+      }
       if (m_cows_table && m_is_write_mode) {   // WI-019 review R6: table reads waiting through a write drain
         for (auto& r : m_read_buffer) if (r.is_cows_table) { r.cows_waited_wm = true; s_table_wm_cycles++; }
       }
@@ -516,6 +548,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         }
         m_dram->issue_command(req_it->command, req_it->addr_vec);
         if (m_cows_table) note_rank_cmd(req_it->command, req_it->addr_vec);   // WI-022 (stats only)
+        if (req_it->command == m_cmd_refab && req_it->addr_vec[m_rank_idx] >= 0)   // WI-026 diagnostic
+          m_ref_end[req_it->addr_vec[m_rank_idx]] = m_clk + m_dram->m_timing_vals("nRFC1");
 
         // If we are issuing the last command, set depart clock cycle and move the request to the pending queue
         if (req_it->command == req_it->final_command) {
