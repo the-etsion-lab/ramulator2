@@ -113,7 +113,9 @@ class SimpleO3LLC : public Clocked<SimpleO3LLC> {
     int64_t m_carve_rem_sets = 0;
     int64_t s_llc_carveout_lines = 0;
     int64_t s_llc_effective_bytes = 0;
-    void set_carveout(int64_t lines, const std::string& mode);
+    bool m_carve_page_aligned = false;   // WI-018: reduced sets taken in whole groups of m_carve_group_sets consecutive sets
+    int64_t m_carve_group_sets = 0;
+    void set_carveout(int64_t lines, const std::string& mode, const std::string& layout = "interleaved", int64_t group_sets = 0);
     int assoc_of(int set_index) const;
     int get_num_sets() const { return m_set_size; }
     int get_associativity() const { return m_associativity; }

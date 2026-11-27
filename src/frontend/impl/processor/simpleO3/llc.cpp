@@ -32,7 +32,10 @@ m_latency(latency), m_cows_cache(cows_cache), m_size_bytes(size_bytes), m_linesi
 // WI-010: remove `lines` LLC lines (CoWs cache stored in the LLC). Every set loses lines/sets ways; the remaining R = lines mod
 // sets sets lose one more, spread uniformly and deterministically: set i loses the extra way iff floor((i+1)R/S) > floor(iR/S).
 // Must be called before any LLC access (checked).
-void SimpleO3LLC::set_carveout(int64_t lines, const std::string& mode) {
+// WI-018: layout page_aligned takes the R reduced sets in whole groups of group_sets consecutive sets (one DRAM page's lines:
+// the set index starts at the line offset, so a page's lines map to group_sets consecutive sets). G = sets/group_sets groups,
+// Rg = R/group_sets reduced groups, spread with the same rule at group level: group g is reduced iff floor((g+1)Rg/G) > floor(g Rg/G).
+void SimpleO3LLC::set_carveout(int64_t lines, const std::string& mode, const std::string& layout, int64_t group_sets) {
   bool empty = m_mshrs.empty();
   for (const auto& [idx, s] : m_cache_sets) {
     empty = empty && s.empty();
@@ -47,11 +50,25 @@ void SimpleO3LLC::set_carveout(int64_t lines, const std::string& mode) {
     throw std::runtime_error(fmt::format("SimpleO3LLC: carve-out of {} lines leaves no way in some sets ({} ways x {} sets)",
                                          lines, m_associativity, m_set_size));
   }
+  if (layout == "page_aligned") {
+    if (group_sets <= 0 || m_set_size % group_sets != 0 || m_carve_rem_sets % group_sets != 0) {
+      throw std::runtime_error(fmt::format("SimpleO3LLC: page_aligned carve-out needs the reduced sets ({}) and the sets ({}) to be "
+                                           "multiples of the group size ({})", m_carve_rem_sets, m_set_size, group_sets));
+    }
+    m_carve_page_aligned = true;
+    m_carve_group_sets = group_sets;
+  } else if (layout != "interleaved") {
+    throw std::runtime_error(fmt::format("SimpleO3LLC: unknown carve-out layout {}", layout));
+  }
   s_llc_carveout_lines = lines;
   s_llc_effective_bytes = (int64_t)m_size_bytes - lines * m_linesize_bytes;
   std::cerr << "# LLC carve-out (" << mode << "): lines=" << lines << " (" << m_carve_full_ways << " full ways + 1 way in "
             << m_carve_rem_sets << " of " << m_set_size << " sets), effective LLC bytes=" << s_llc_effective_bytes
             << " of " << m_size_bytes << std::endl;
+  if (m_carve_page_aligned) {
+    std::cerr << "# LLC carve-out layout page_aligned: " << m_carve_rem_sets / m_carve_group_sets << " of " << m_set_size / m_carve_group_sets
+              << " groups of " << m_carve_group_sets << " consecutive sets" << std::endl;
+  }
 }
 
 int SimpleO3LLC::assoc_of(int set_index) const {
@@ -59,6 +76,9 @@ int SimpleO3LLC::assoc_of(int set_index) const {
     return m_associativity;
   }
   int64_t i = set_index, S = m_set_size, R = m_carve_rem_sets;
+  if (m_carve_page_aligned) {   // WI-018: the same rule over groups of m_carve_group_sets consecutive sets
+    i /= m_carve_group_sets; S /= m_carve_group_sets; R /= m_carve_group_sets;
+  }
   int extra = ((i + 1) * R / S > i * R / S) ? 1 : 0;
   return m_associativity - m_carve_full_ways - extra;
 }

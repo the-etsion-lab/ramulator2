@@ -21,6 +21,7 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
     bool m_cows_check_page_geometry = true;    // WI-004 D10
     bool m_cows_geometry_checked = false;      // WI-004 D10
     std::string m_cows_carveout = "none";      // WI-010
+    std::string m_cows_carveout_layout = "interleaved";   // WI-018
     std::string m_cows_placement = "self";     // WI-013
     uint64_t m_cows_source_pool = 0;           // WI-013
     int m_llc_linesize_bytes = 64;             // WI-010
@@ -79,6 +80,11 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
       }
       m_cows_carveout = param<std::string>("cows_carveout")
         .desc("WI-010: charge the CoWs cache's LLC capacity: none | ways | lines.").default_val("none");
+      m_cows_carveout_layout = param<std::string>("cows_carveout_layout")
+        .desc("WI-018: interleaved (reduced sets spread one by one) or page_aligned (in groups of one DRAM page's sets)").default_val("interleaved");
+      if (m_cows_carveout_layout != "interleaved" && m_cows_carveout_layout != "page_aligned") {
+        throw ConfigurationError("cows_carveout_layout must be interleaved or page_aligned (got {})", m_cows_carveout_layout);
+      }
       if (m_cows_carveout != "none" && m_cows_carveout != "ways" && m_cows_carveout != "lines") {
         throw ConfigurationError("cows_carveout must be none, ways or lines (got {})", m_cows_carveout);
       }
@@ -398,7 +404,7 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
       std::cerr << "# CoWs carve-out: cows bytes=" << m_cows_cache->s_cache_bytes << ", exact lines=" << lines_bytes
                 << ", physical lines (" << m_cows_cache->get_num_sets() << " sets x " << lines_per_cows_set << ")=" << lines_physical
                 << ", mode " << m_cows_carveout << " -> carve " << lines << " lines" << std::endl;
-      m_llc->set_carveout(lines, m_cows_carveout);
+      m_llc->set_carveout(lines, m_cows_carveout, m_cows_carveout_layout, (int64_t)(m_cows_page_bytes / m_llc_linesize_bytes));
     }
 
     void check_cows_page_geometry(IMemorySystem* memory_system) {
