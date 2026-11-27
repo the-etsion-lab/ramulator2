@@ -104,6 +104,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     };
     LatHist m_tw, m_tw_wm, m_tw_rm, m_tw_busy, m_tsvc;
     uint64_t s_tw_notready = 0, s_tw_ready = 0, s_tw_busy_pre_ready = 0, s_tw_nr_bank = 0;
+    uint64_t s_tw_nr_level[3] = {0, 0, 0};   // notready ticks blocked at level 0..2 (channel / rank / bankgroup), non-exclusive
     LatHist m_tw_occ;   // review H1: target bank occupied = bank_busy + notready blocked at the bank level
     // WI-021 `first_drain`: a ready table read may bypass a write drain, while (a) the write buffer is below kWriteBypassLimit
     // (= max_size; ReqBuffer::enqueue accepts up to max_size + 1, so this is a slightly conservative hard limit) and (b) fewer than
@@ -309,6 +310,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
           register_stat(s_tw_ready).name("table_read_wait_rm_ready_sum_{}", m_channel_id);
           register_stat(s_tw_nr_bank).name("table_read_wait_rm_notready_bank_sum_{}", m_channel_id);
           register_stat(s_tw_busy_pre_ready).name("table_read_wait_bank_busy_pre_ready_sum_{}", m_channel_id);
+          for (int l = 0; l < m_bank_addr_idx && l < 3; l++)
+            register_stat(s_tw_nr_level[l]).name("table_read_wait_rm_notready_{}_ticks_{}", m_dram->m_levels(l), m_channel_id);
         }
         register_stat(s_drain_bypasses).name("table_drain_bypasses_{}", m_channel_id);   // WI-021
         register_stat(s_drain_bypass_pre).name("table_drain_bypass_pre_{}", m_channel_id);
@@ -453,7 +456,9 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
             if (ready) s_tw_busy_pre_ready++;
           } else if (!ready) {   // review H1: blocked at the target bank (tRP/tRC recovery) vs above it (tRRD/tFAW/tCCD/bus)
             r.cows_wait_notready++;
-            if (m_dram->check_ready_block_mask(pc, r.addr_vec) & (1 << m_bank_addr_idx)) r.cows_wait_nr_bank++;
+            int bm = m_dram->check_ready_block_mask(pc, r.addr_vec);
+            if (bm & (1 << m_bank_addr_idx)) r.cows_wait_nr_bank++;
+            for (int l = 0; l < m_bank_addr_idx && l < 3; l++) if (bm & (1 << l)) s_tw_nr_level[l]++;   // non-exclusive
           } else
             r.cows_wait_ready++;
         }
