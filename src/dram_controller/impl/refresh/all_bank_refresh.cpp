@@ -20,9 +20,20 @@ class AllBankRefresh : public IRefreshManager, public Implementation {
     int m_ref_req_id = -1;
     Clk_t m_next_refresh_cycle = -1;
 
+    // WI-026: `stagger: rank` gives rank r of channel c its first REFab at nREFI * (1 + (c*R + r) / (C*R)) (integer floor), then
+    // every nREFI, so the C*R ranks refresh evenly spread over the interval. `none` (default) = stock lockstep behaviour.
+    bool m_stagger = false;
+    std::vector<Clk_t> m_next_rank;
+    std::vector<uint64_t> s_refab_sent;     // per rank, whole run (not reset at warmup)
+    std::vector<uint64_t> s_first_refresh;  // per rank
+    uint64_t s_clk = 0;                     // controller cycles of the whole run (the stock count is floor(clk / nREFI))
+
   public:
     void init() override { 
       m_ctrl = cast_parent<IDRAMController>();
+      std::string s = param<std::string>("stagger").desc("WI-026: none (stock, all ranks at once) | rank").default_val("none");
+      if (s != "none" && s != "rank") throw ConfigurationError("AllBank stagger must be none or rank (got {})", s);
+      m_stagger = s == "rank";
     };
 
     void setup(IFrontEnd* frontend, IMemorySystem* memory_system) override {
@@ -35,10 +46,36 @@ class AllBankRefresh : public IRefreshManager, public Implementation {
       m_ref_req_id = m_dram->m_requests("all-bank-refresh");
 
       m_next_refresh_cycle = m_nrefi;
+      if (m_stagger) {   // WI-026
+        int C = m_dram->get_level_size("channel"), c = m_ctrl->m_channel_id;
+        register_stat(s_clk, false).name("refresh_clk_ch{}", c);
+        m_next_rank.resize(m_num_ranks); s_refab_sent.assign(m_num_ranks, 0); s_first_refresh.assign(m_num_ranks, 0);
+        for (int r = 0; r < m_num_ranks; r++) {
+          m_next_rank[r] = m_nrefi + (Clk_t)((int64_t)m_nrefi * (c * m_num_ranks + r) / ((int64_t)C * m_num_ranks));
+          s_first_refresh[r] = m_next_rank[r];
+          register_stat(s_refab_sent[r], false).name("refab_sent_ch{}_rank{}", c, r);
+          register_stat(s_first_refresh[r], false).name("first_refresh_cycle_ch{}_rank{}", c, r);
+        }
+      }
     };
 
     void tick() {
       m_clk++;
+
+      if (m_stagger) {   // WI-026: per-rank schedule
+        s_clk = m_clk;
+        for (int r = 0; r < m_num_ranks; r++) {
+          if (m_clk != m_next_rank[r]) continue;
+          m_next_rank[r] += m_nrefi;
+          std::vector<int> addr_vec(m_dram_org_levels, -1);
+          addr_vec[0] = m_ctrl->m_channel_id;
+          addr_vec[1] = r;
+          Request req(addr_vec, m_ref_req_id);
+          if (!m_ctrl->priority_send(req)) throw std::runtime_error("Failed to send refresh!");
+          s_refab_sent[r]++;
+        }
+        return;
+      }
 
       if (m_clk == m_next_refresh_cycle) {
         m_next_refresh_cycle += m_nrefi;
