@@ -257,10 +257,17 @@ void CoWsCache::set_source_index_bits(uint32_t src_index_bits) {
         std::cerr << "# COWs table-line fetch: " << m_entries_per_line << " entries per 64B table line (cache entry " << s_entry_bits
                   << " b incl. tag; table entry tagless)" << std::endl;
     }
+    if (m_entry_pages == 1) {
     std::cerr<<"# COWs cache: entry bits="<<s_entry_bits
              <<" (tag+valid+dirty="<<Line::getTagBits()<<", src row index="<<src_index_bits<<", src valid=1"
              <<", bitmap="<<AddrParser::getNumBlocksPerPage()<<"), entries="<<(uint64_t)m_nsets * m_assoc
              <<", bytes="<<s_cache_bytes<<std::endl;
+    } else {   // WI-020 (review nit): the region breakdown
+    std::cerr<<"# COWs cache: entry bits="<<s_entry_bits
+             <<" (tag+v+d="<<Line::getTagBits() - m_entry_shift<<", "<<m_entry_pages<<" x ("<<src_index_bits<<"+1+"
+             <<AddrParser::getNumBlocksPerPage()<<")), entries="<<(uint64_t)m_nsets * m_assoc
+             <<", bytes="<<s_cache_bytes<<std::endl;
+    }
 }
 
 void CoWsCache::maybe_redirect(Request& req, bool is_fill) {
