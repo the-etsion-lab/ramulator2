@@ -101,7 +101,7 @@ void SimpleO3LLC::tick() {
     if (m_cows_cache && m_cows_cache->m_real_table && it->first > m_clk + (1 << 20))
       throw std::runtime_error("WI-019 R1: a miss-list entry carries a latency derived from NOT_READY");
     if (m_clk >= it->first && (!it->tok || it->tok->done)) {
-      if (it->tok) { it->tok->waiters++; it->tok.reset(); }   // WI-019: the table read completed; no speculation before it (D-34)
+      it->tok.reset();   // WI-019: the table read completed; no speculation before it (D-34)
       it->second.llc2mc = m_clk;
       it->second.mc2llc = m_clk; // this field will be updated when the request arrives at LLC from MC. We set it here since not all requests are sent back to us.
       if (!m_memory_system->send(it->second)) {
@@ -245,10 +245,12 @@ bool SimpleO3LLC::send(Request req) {
     // Yoav: is the dram page translation available in the cows cache?
     uint32_t cows_latency = 0;
     bool cows_miss = false;
+    CoWsCache::TokenPtr fill_tok;   // WI-019 review B1: taken right after llc_miss, before allocate_line can evict (llc_evict reuses the slot)
     if(m_cows_cache != nullptr) {
       bool cows_miss_not_handled = false;
       // WI-004 D2: pass the original request type (req was converted Write->Read above); used for stats only
       std::tie(cows_miss, cows_latency, cows_miss_not_handled) = m_cows_cache->llc_miss(req.addr, dirty, m_clk, total_misses());
+      fill_tok = m_cows_cache->take_last_token();
       if(cows_miss_not_handled) {
         // cannot allocate line in cows cache (e.g., all lines in the set are pending). The core retries later;
         // WI-004 D6: the LLC miss is counted only when the request is accepted.
@@ -298,12 +300,11 @@ bool SimpleO3LLC::send(Request req) {
     if (m_cows_cache != nullptr) {
       m_cows_cache->maybe_redirect(to_mem, dirty);   // dirty: an L2 writeback that missed = write-allocate fill
     }
-    CoWsCache::TokenPtr tok;
-    if (m_cows_cache != nullptr) {   // WI-019: the fill waits on the table read (real mode); count data requests in the table region
-      tok = m_cows_cache->take_last_token();
+    if (m_cows_cache != nullptr) {   // WI-019: the fill waits on its table read (real mode); count data requests in the table region
       m_cows_cache->count_data_addr(to_mem.addr);
+      if (fill_tok) fill_tok->waiters++;   // review M1: counted at attach
     }
-    m_miss_list.push_back({m_clk + m_latency + cows_latency, to_mem, tok});
+    m_miss_list.push_back({m_clk + m_latency + cows_latency, to_mem, fill_tok});
 
     return true;
   }
@@ -416,6 +417,7 @@ void SimpleO3LLC::evict_line(CacheSet_t& set, CacheSet_t::iterator victim_it) {
     if (m_cows_cache != nullptr) {   // WI-019: the writeback waits on the entry's (or the C1 update's) table read
       tok = m_cows_cache->take_last_token();
       m_cows_cache->count_data_addr(writeback_req.addr);
+      if (tok) tok->waiters++;   // review M1
     }
     m_miss_list.push_back({m_clk + m_latency + cows_latency, writeback_req, tok});
 

@@ -558,6 +558,7 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_hit(Addr_t baddr, bool is_write,
 
 std::tuple<bool, uint32_t, bool> CoWsCache::llc_miss(Addr_t baddr, bool is_write, Clk_t clk, int total_llc_misses)
 {
+    if (m_last_token) throw std::runtime_error("WI-019 review B1: a table token was not taken by the LLC before the next lookup");
     AddrParser ap(baddr);
     auto page_addr = ap.getPageAddr();
     auto page_num = ap.getPageNum();
@@ -658,6 +659,7 @@ void foo_break() { printf("breaking here\n"); }
 
 std::tuple<bool, uint32_t, bool> CoWsCache::llc_evict(Addr_t baddr, bool evict_dirty, Clk_t clk, int total_llc_misses)
 {
+    if (m_last_token) throw std::runtime_error("WI-019 review B1: a table token was not taken by the LLC before the next lookup");
     AddrParser ap(baddr);
     auto page_addr = ap.getPageAddr();
     auto page_num = ap.getPageNum();
