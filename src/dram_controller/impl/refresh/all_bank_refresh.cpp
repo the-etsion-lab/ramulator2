@@ -20,8 +20,9 @@ class AllBankRefresh : public IRefreshManager, public Implementation {
     int m_ref_req_id = -1;
     Clk_t m_next_refresh_cycle = -1;
 
-    // WI-026: `stagger: rank` gives rank r of channel c its first REFab at nREFI * (1 + (c*R + r) / (C*R)) (integer floor), then
-    // every nREFI, so the C*R ranks refresh evenly spread over the interval. `none` (default) = stock lockstep behaviour.
+    // WI-026: `stagger: rank` gives rank r of channel c its first REFab at nREFI * (1 + (r*C + c) / (C*R)) (integer floor), then
+    // every nREFI, so the C*R ranks refresh evenly spread over the interval. Rank-major order (review D1): the ranks of one channel are
+    // nREFI/R apart, so (with nRFC1 < nREFI/R) they are never in refresh at the same time. `none` (default) = stock lockstep behaviour.
     bool m_stagger = false;
     std::vector<Clk_t> m_next_rank;
     std::vector<uint64_t> s_refab_sent;     // per rank, whole run (not reset at warmup)
@@ -51,7 +52,7 @@ class AllBankRefresh : public IRefreshManager, public Implementation {
         register_stat(s_clk, false).name("refresh_clk_ch{}", c);
         m_next_rank.resize(m_num_ranks); s_refab_sent.assign(m_num_ranks, 0); s_first_refresh.assign(m_num_ranks, 0);
         for (int r = 0; r < m_num_ranks; r++) {
-          m_next_rank[r] = m_nrefi + (Clk_t)((int64_t)m_nrefi * (c * m_num_ranks + r) / ((int64_t)C * m_num_ranks));
+          m_next_rank[r] = m_nrefi + (Clk_t)((int64_t)m_nrefi * (r * C + c) / ((int64_t)C * m_num_ranks));   // review D1: rank-major
           s_first_refresh[r] = m_next_rank[r];
           register_stat(s_refab_sent[r], false).name("refab_sent_ch{}_rank{}", c, r);
           register_stat(s_first_refresh[r], false).name("first_refresh_cycle_ch{}_rank{}", c, r);
