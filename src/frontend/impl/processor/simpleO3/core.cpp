@@ -201,6 +201,11 @@ void SimpleO3Core::tick() {
       auto insts = s_insts_retired - s_prev_insts_retired;
       auto cycle = m_clk - s_prev_clk;
       s_stats_ipc.push_back({m_clk, 1.0f*insts/cycle});
+      if (CoWsCache* cc = m_llc->get_cows_cache()) {   // WI-018 amendment: sampled with the IPC samples (stats only)
+        std::array<uint64_t, 3> k{0, 0, 0};
+        if ((size_t)m_id < cc->m_core_fill_kind.size()) k = cc->m_core_fill_kind[m_id];
+        s_stats_cows_interval.push_back({(uint64_t)m_clk, k[0], k[1], k[2]});
+      }
       if(m_id == 0) {
         printf("# Core %d: Retired %lu instructions at cycle %lu (%.2f IPC for the last %lu instructions)\n",
                m_id, (unsigned long)s_insts_retired, (unsigned long)m_clk, 1.0f*insts/cycle, (unsigned long)insts);
@@ -309,6 +314,11 @@ void SimpleO3Core::fini() {
                  fmt::format("core{}_ipc_stats", m_id),
                  fmt::format("# IPC trace: (cycle, ipc)"),
                  formatter_2tuple);
+  if (!s_stats_cows_interval.empty()) {   // WI-018 amendment: one row per IPC sample, same order as core<N>_ipc_stats
+    std::ofstream of(fmt::format("core{}_cows_interval", m_id));
+    of << "# CoWs LLC read-miss fills of this core, cumulative from the start: cycle written redirected not_renamed" << std::endl;
+    for (const auto& r : s_stats_cows_interval) of << r[0] << "\t" << r[1] << "\t" << r[2] << "\t" << r[3] << std::endl;
+  }
 }
 
 }        // namespace Ramulator

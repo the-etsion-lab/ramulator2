@@ -118,6 +118,7 @@ class SimpleO3LLC : public Clocked<SimpleO3LLC> {
     void set_carveout(int64_t lines, const std::string& mode, const std::string& layout = "interleaved", int64_t group_sets = 0);
     int assoc_of(int set_index) const;
     int get_num_sets() const { return m_set_size; }
+    CoWsCache* get_cows_cache() const { return m_cows_cache; }   // WI-018 (per-interval counters)
     int get_associativity() const { return m_associativity; }
     int get_size_bytes() const { return m_size_bytes; }
 

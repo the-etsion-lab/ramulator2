@@ -22,6 +22,8 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
     bool m_cows_geometry_checked = false;      // WI-004 D10
     std::string m_cows_carveout = "none";      // WI-010
     std::string m_cows_carveout_layout = "interleaved";   // WI-018
+    int64_t m_llc_carveout_lines = 0;                     // WI-018 amendment: carve-out without a CoWs cache (no-CoWs baseline)
+    bool m_llc_carveout_applied = false;
     std::string m_cows_placement = "self";     // WI-013
     uint64_t m_cows_source_pool = 0;           // WI-013
     int m_llc_linesize_bytes = 64;             // WI-010
@@ -84,6 +86,11 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
         .desc("WI-018: interleaved (reduced sets spread one by one) or page_aligned (in groups of one DRAM page's sets)").default_val("interleaved");
       if (m_cows_carveout_layout != "interleaved" && m_cows_carveout_layout != "page_aligned") {
         throw ConfigurationError("cows_carveout_layout must be interleaved or page_aligned (got {})", m_cows_carveout_layout);
+      }
+      m_llc_carveout_lines = param<int64_t>("llc_carveout_lines")
+        .desc("WI-018: carve this many LLC lines (layout cows_carveout_layout) when no CoWs cache is configured; 0 = none").default_val(0);
+      if (m_llc_carveout_lines < 0) {
+        throw ConfigurationError("llc_carveout_lines must be >= 0");
       }
       if (m_cows_carveout != "none" && m_cows_carveout != "ways" && m_cows_carveout != "lines") {
         throw ConfigurationError("cows_carveout must be none, ways or lines (got {})", m_cows_carveout);
@@ -293,6 +300,14 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
         check_cows_page_geometry(m_memory_system);
         m_cows_geometry_checked = true;
         apply_cows_carveout();
+      }
+      if (m_llc_carveout_lines > 0 && !m_llc_carveout_applied) {   // WI-018 amendment: same geometry as a CoWs run, no CoWs
+        if (m_cows_cache != nullptr) {
+          throw ConfigurationError("llc_carveout_lines is for runs without a CoWs cache (the CoWs carve-out is cows_carveout)");
+        }
+        m_llc_carveout_applied = true;
+        std::cerr << "# LLC carve-out without CoWs: llc_carveout_lines=" << m_llc_carveout_lines << std::endl;
+        m_llc->set_carveout(m_llc_carveout_lines, "lines", m_cows_carveout_layout, (int64_t)(m_cows_page_bytes / m_llc_linesize_bytes));
       }
 
       if(m_clk % 1000000 == 0) {

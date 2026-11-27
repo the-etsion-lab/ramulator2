@@ -3,6 +3,7 @@
 #define VICTIM_ADDRESS 0x206840100
 
 #include <vector>
+#include <array>
 #include <list>
 #include <bit>
 #include <cassert>
@@ -425,6 +426,9 @@ public:
     uint64_t s_redirected_fills = 0;      // of which write-allocate fills (PI ruling: fills of unwritten blocks are redirected)
     uint64_t s_unwritten_block_misses = 0;
     uint64_t s_written_block_misses = 0;
+    // WI-018 amendment (stats only): per-core cumulative LLC read-miss fills by kind, [core][0 written, 1 redirected (unwritten,
+    // renamed), 2 not renamed (unwritten)]; sampled by each core at its 1M-instruction IPC samples (core<N>_cows_interval)
+    std::vector<std::array<uint64_t, 3>> m_core_fill_kind;
     uint64_t s_tracked_pages = 0;         // pages with an entry (= renamed pages when placement != self); whole run
     // WI-015: table-line fetch - one table read brings the whole 64B table line (entries_per_line entries of consecutive pages)
     bool m_table_line_fetch = false;

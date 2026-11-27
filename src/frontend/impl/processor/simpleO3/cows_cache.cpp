@@ -264,16 +264,25 @@ void CoWsCache::maybe_redirect(Request& req, bool is_fill) {
     if (it == m_perfect_cache.end()) {
         return;   // no entry (cannot happen on the LLC-miss path: the lookup creates it)
     }
+    auto core_count = [&](int k) {   // WI-018 amendment: per-core counters (stats only)
+        if (req.source_id >= 0) {
+            if ((size_t)req.source_id >= m_core_fill_kind.size()) m_core_fill_kind.resize(req.source_id + 1, {0, 0, 0});
+            m_core_fill_kind[req.source_id][k]++;
+        }
+    };
     if (it->second.getBlockID(AddrParser::getBlockIdx(req.addr))) {
         s_written_block_misses++;
+        core_count(0);
         return;   // written block: it lives in the page's own row
     }
     if (m_renamed_fraction < 1.0 &&
         (double)(mix64((uint64_t)ap.getPageNum() ^ 0xF4AC7105ull) >> 11) * 0x1.0p-53 >= m_renamed_fraction) {
         s_not_renamed_unwritten_misses++;
+        core_count(2);
         return;   // page not renamed: its data lives in its own row
     }
     s_unwritten_block_misses++;
+    core_count(1);
     if (m_placement == Placement::SELF) {
         return;   // today's model: the data is read from the own row
     }

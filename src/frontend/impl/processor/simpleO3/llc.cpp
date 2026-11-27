@@ -51,7 +51,7 @@ void SimpleO3LLC::set_carveout(int64_t lines, const std::string& mode, const std
                                          lines, m_associativity, m_set_size));
   }
   if (layout == "page_aligned") {
-    if (group_sets <= 0 || m_set_size % group_sets != 0 || m_carve_rem_sets % group_sets != 0) {
+    if (group_sets <= 0 || (group_sets & (group_sets - 1)) != 0 || m_set_size % group_sets != 0 || m_carve_rem_sets % group_sets != 0) {
       throw std::runtime_error(fmt::format("SimpleO3LLC: page_aligned carve-out needs the reduced sets ({}) and the sets ({}) to be "
                                            "multiples of the group size ({})", m_carve_rem_sets, m_set_size, group_sets));
     }
@@ -66,7 +66,8 @@ void SimpleO3LLC::set_carveout(int64_t lines, const std::string& mode, const std
             << m_carve_rem_sets << " of " << m_set_size << " sets), effective LLC bytes=" << s_llc_effective_bytes
             << " of " << m_size_bytes << std::endl;
   if (m_carve_page_aligned) {
-    std::cerr << "# LLC carve-out layout page_aligned: " << m_carve_rem_sets / m_carve_group_sets << " of " << m_set_size / m_carve_group_sets
+    std::cerr << "# LLC carve-out layout page_aligned: P=" << m_carve_group_sets << " sets per DRAM page; "
+              << m_carve_rem_sets / m_carve_group_sets << " of " << m_set_size / m_carve_group_sets
               << " groups of " << m_carve_group_sets << " consecutive sets" << std::endl;
   }
 }

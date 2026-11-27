@@ -154,6 +154,7 @@ class SimpleO3Core : public Clocked<SimpleO3Core> {
     Clk_t  s_mem_access_cycles = 0;
 
     std::vector<std::tuple<Clk_t, float>> s_stats_ipc;
+    std::vector<std::array<uint64_t, 4>> s_stats_cows_interval;   // WI-018: (cycle, written, redirected, not renamed) cumulative fills
     size_t s_last_printed_insts = 0;
     size_t s_prev_insts_retired = 0;
     size_t s_prev_clk = 0;
