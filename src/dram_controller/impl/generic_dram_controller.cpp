@@ -103,7 +103,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       }
     };
     LatHist m_tw, m_tw_wm, m_tw_rm, m_tw_busy, m_tsvc;
-    uint64_t s_tw_notready = 0, s_tw_ready = 0;
+    uint64_t s_tw_notready = 0, s_tw_ready = 0, s_tw_busy_pre_ready = 0, s_tw_nr_bank = 0;
+    LatHist m_tw_occ;   // review H1: target bank occupied = bank_busy + notready blocked at the bank level
     // WI-021 `first_drain`: a ready table read may bypass a write drain, while (a) the write buffer is below kWriteBypassLimit
     // (= max_size; ReqBuffer::enqueue accepts up to max_size + 1, so this is a slightly conservative hard limit) and (b) fewer than
     // m_drain_bypass_max bypasses happened since the last issued write.
@@ -208,7 +209,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     void on_reset_stats() override {
       m_read_lat_by_class.clear();   // registered sums/counts are reset by the stats system
       m_table_read_lat_hist.clear();   // WI-019
-      for (auto* x : {&m_tw, &m_tw_wm, &m_tw_rm, &m_tw_busy, &m_tsvc}) x->h.clear();   // WI-022 (sums are registered)
+      for (auto* x : {&m_tw, &m_tw_wm, &m_tw_rm, &m_tw_busy, &m_tw_occ, &m_tsvc}) x->h.clear();   // WI-022 (sums are registered)
     }
 
     void setup(IFrontEnd* frontend, IMemorySystem* memory_system) override {
@@ -296,7 +297,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         register_stat(s_table_first_picks).name("table_first_picks_{}", m_channel_id);
         {   // WI-022 item 1
           std::pair<LatHist*, const char*> hs[] = {{&m_tw, "wait"}, {&m_tw_wm, "wait_wm"}, {&m_tw_rm, "wait_rm"},
-                                                   {&m_tw_busy, "wait_bank_busy"}, {&m_tsvc, "service"}};
+                                                   {&m_tw_busy, "wait_bank_busy"}, {&m_tw_occ, "wait_bank_occupied"},
+                                                   {&m_tsvc, "service"}};
           for (auto& [x, n] : hs) {
             register_stat(x->sum).name("table_read_{}_sum_{}", n, m_channel_id);
             register_stat(x->mean).name("table_read_{}_mean_{}", n, m_channel_id);
@@ -305,6 +307,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
           }
           register_stat(s_tw_notready).name("table_read_wait_rm_notready_sum_{}", m_channel_id);
           register_stat(s_tw_ready).name("table_read_wait_rm_ready_sum_{}", m_channel_id);
+          register_stat(s_tw_nr_bank).name("table_read_wait_rm_notready_bank_sum_{}", m_channel_id);
+          register_stat(s_tw_busy_pre_ready).name("table_read_wait_bank_busy_pre_ready_sum_{}", m_channel_id);
         }
         register_stat(s_drain_bypasses).name("table_drain_bypasses_{}", m_channel_id);   // WI-021
         register_stat(s_drain_bypass_pre).name("table_drain_bypass_pre_{}", m_channel_id);
@@ -442,11 +446,15 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         for (auto& r : m_read_buffer) {
           if (!r.is_cows_table || r.is_stat_updated) continue;
           if (m_is_write_mode) { r.cows_wait_wm++; continue; }
-          if (m_dram->check_node_open(r.final_command, r.addr_vec) && !m_dram->check_rowbuffer_hit(r.final_command, r.addr_vec))
-            r.cows_wait_busy++;
-          else if (!m_dram->check_ready(m_dram->get_preq_command(r.final_command, r.addr_vec), r.addr_vec))
+          int pc = m_dram->get_preq_command(r.final_command, r.addr_vec);
+          bool ready = m_dram->check_ready(pc, r.addr_vec);
+          if (m_dram->check_node_open(r.final_command, r.addr_vec) && !m_dram->check_rowbuffer_hit(r.final_command, r.addr_vec)) {
+            r.cows_wait_busy++;   // review H2: is the PRE itself timing-blocked (tRAS/tRTP/tWR) or ready but not issued?
+            if (ready) s_tw_busy_pre_ready++;
+          } else if (!ready) {   // review H1: blocked at the target bank (tRP/tRC recovery) vs above it (tRRD/tFAW/tCCD/bus)
             r.cows_wait_notready++;
-          else
+            if (m_dram->check_ready_block_mask(pc, r.addr_vec) & (1 << m_bank_addr_idx)) r.cows_wait_nr_bank++;
+          } else
             r.cows_wait_ready++;
         }
       }
@@ -617,8 +625,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
                 // WI-022 item 1: wait / service split at the first command; the per-tick classes cover the wait
                 m_tw.add(req.cows_first_cmd - req.arrive); m_tsvc.add(req.depart - req.cows_first_cmd);
                 m_tw_wm.add(req.cows_wait_wm); m_tw_rm.add(req.cows_wait_busy + req.cows_wait_notready + req.cows_wait_ready);
-                m_tw_busy.add(req.cows_wait_busy);
-                s_tw_notready += req.cows_wait_notready; s_tw_ready += req.cows_wait_ready;
+                m_tw_busy.add(req.cows_wait_busy); m_tw_occ.add(req.cows_wait_busy + req.cows_wait_nr_bank);
+                s_tw_notready += req.cows_wait_notready; s_tw_ready += req.cows_wait_ready; s_tw_nr_bank += req.cows_wait_nr_bank;
               } else {
                 s_data_reads++; s_data_read_lat_sum += lat;
               }
@@ -771,7 +779,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
           if (acc * 10 >= n * 9) { s_table_read_lat_p90 = l; break; }
         }
         s_data_read_lat_mean = s_data_reads ? (float)s_data_read_lat_sum / s_data_reads : 0;
-        for (auto* x : {&m_tw, &m_tw_wm, &m_tw_rm, &m_tw_busy, &m_tsvc}) x->fin();   // WI-022 item 1
+        for (auto* x : {&m_tw, &m_tw_wm, &m_tw_rm, &m_tw_busy, &m_tw_occ, &m_tsvc}) x->fin();   // WI-022 item 1
       }
 
       s_queue_len_avg = (float) s_queue_len / (float) m_clk;

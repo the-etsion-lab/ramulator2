@@ -404,6 +404,11 @@ class DDR5COW : public IDRAM, public Implementation {
       return m_channels[channel_id]->check_ready(command, addr_vec, m_clk);
     };
 
+    int check_ready_block_mask(int command, const AddrVec_t& addr_vec) override {   // WI-022 (stats only)
+      int channel_id = addr_vec[m_levels["channel"]];
+      return m_channels[channel_id]->check_ready_block_mask(command, addr_vec, m_clk);
+    };
+
     bool check_rowbuffer_hit(int command, const AddrVec_t& addr_vec) override {
       int channel_id = addr_vec[m_levels["channel"]];
       return m_channels[channel_id]->check_rowbuffer_hit(command, addr_vec, m_clk);

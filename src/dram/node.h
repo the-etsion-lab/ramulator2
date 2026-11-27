@@ -231,6 +231,16 @@ struct DRAMNodeBase {
       }
     };
 
+    // WI-022 (stats only): bit m_level set for every node on the path whose ready clock blocks `command` at `clk`. Follows the
+    // addressed child only (stops at the command's scope, a leaf, or an unaddressed level), like check_ready for PRE/ACT/RD/WR.
+    int check_ready_block_mask(int command, const AddrVec_t& addr_vec, Clk_t clk) {
+      int mask = (m_cmd_ready_clk[command] != -1 && clk < m_cmd_ready_clk[command]) ? (1 << m_level) : 0;
+      if (m_level == m_spec->m_command_scopes[command] || !m_child_nodes.size()) return mask;
+      int child_id = addr_vec[m_level+1];
+      if (child_id == -1) return mask;
+      return mask | m_child_nodes[child_id]->check_ready_block_mask(command, addr_vec, clk);
+    };
+
     bool check_rowbuffer_hit(int command, const AddrVec_t& addr_vec, Clk_t m_clk) {
       // TODO: Optimize this by just checking the bank-levels? Have a dedicated bank structure?
       int child_id = addr_vec[m_level+1];

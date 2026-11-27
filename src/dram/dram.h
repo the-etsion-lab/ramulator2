@@ -109,6 +109,13 @@ class IDRAM : public Clocked<IDRAM> {
     virtual bool check_ready(int command, const AddrVec_t& addr_vec) = 0;
 
     /**
+     * @brief     WI-022 (stats only): which levels on the command's address path block it now
+     * @details   Bit l is set if the node at level l on the path has m_cmd_ready_clk[command] > now (the same test as
+     *            check_ready, but it does not stop at the first blocking level). 0 = ready, or not implemented by this standard.
+     */
+    virtual int check_ready_block_mask(int command, const AddrVec_t& addr_vec) { return 0; };
+
+    /**
      * @brief     Checks whether the command will result in a rowbuffer hit
      * @details
      * Given a command and its address, this function should return whether it will
