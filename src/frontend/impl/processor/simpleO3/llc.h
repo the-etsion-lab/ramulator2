@@ -39,7 +39,9 @@ class SimpleO3LLC : public Clocked<SimpleO3LLC> {
 
     // Request that miss in the LLC with the clock cycle (current cycle + llc latency) that they
     // should be sent to the memory system
-    std::list<std::pair<Clk_t, Request>> m_miss_list;
+    // WI-019: a miss-list entry may wait on a CoWs table read (token); it is sent when m_clk >= first AND the token is done.
+    struct MissEntry { Clk_t first; Request second; CoWsCache::TokenPtr tok; };
+    std::list<MissEntry> m_miss_list;
 
     // Request that hit in the LLC with the clock cycle (current cycle + llc latency) that they
     // should be sent back to the core (calls the callback)

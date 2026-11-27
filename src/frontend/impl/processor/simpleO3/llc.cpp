@@ -90,13 +90,18 @@ void SimpleO3LLC::tick() {
   // Check pending lines in cows cache and update their status.
   if(m_cows_cache != nullptr) {
     m_cows_cache->check_pending_lines(m_clk);
+    if (m_cows_cache->m_real_table) m_cows_cache->issue_table_requests(m_memory_system);   // WI-019
   }
 
   // Send miss requests to the memory system when LLC latency is met
   // TODO: Optimization by assuming in-order issue?
   auto it = m_miss_list.begin();
   while (it != m_miss_list.end()) {
-    if (m_clk >= it->first) {
+    // WI-019 R1: in real mode no entry may carry a latency derived from NOT_READY
+    if (m_cows_cache && m_cows_cache->m_real_table && it->first > m_clk + (1 << 20))
+      throw std::runtime_error("WI-019 R1: a miss-list entry carries a latency derived from NOT_READY");
+    if (m_clk >= it->first && (!it->tok || it->tok->done)) {
+      if (it->tok) { it->tok->waiters++; it->tok.reset(); }   // WI-019: the table read completed; no speculation before it (D-34)
       it->second.llc2mc = m_clk;
       it->second.mc2llc = m_clk; // this field will be updated when the request arrives at LLC from MC. We set it here since not all requests are sent back to us.
       if (!m_memory_system->send(it->second)) {
@@ -113,17 +118,17 @@ void SimpleO3LLC::tick() {
   }
 
   // call hit request callback when LLC latency is met
-  it = m_hit_list.begin();
-  while (it != m_hit_list.end()) {
-    if (m_clk >= it->first) {
-      std::vector<Request> _req_v{it->second};
-      m_receive_requests[it->second.addr] = _req_v;
+  auto hit = m_hit_list.begin();
+  while (hit != m_hit_list.end()) {
+    if (m_clk >= hit->first) {
+      std::vector<Request> _req_v{hit->second};
+      m_receive_requests[hit->second.addr] = _req_v;
 
-      it->second.callback(it->second);
-      it = m_hit_list.erase(it);
+      hit->second.callback(hit->second);
+      hit = m_hit_list.erase(hit);
     }
     else {
-      it++;
+      hit++;
     }
   }
 };
@@ -293,13 +298,20 @@ bool SimpleO3LLC::send(Request req) {
     if (m_cows_cache != nullptr) {
       m_cows_cache->maybe_redirect(to_mem, dirty);   // dirty: an L2 writeback that missed = write-allocate fill
     }
-    m_miss_list.push_back(std::make_pair(m_clk + m_latency + cows_latency, to_mem));
+    CoWsCache::TokenPtr tok;
+    if (m_cows_cache != nullptr) {   // WI-019: the fill waits on the table read (real mode); count data requests in the table region
+      tok = m_cows_cache->take_last_token();
+      m_cows_cache->count_data_addr(to_mem.addr);
+    }
+    m_miss_list.push_back({m_clk + m_latency + cows_latency, to_mem, tok});
 
     return true;
   }
 };
 
 void SimpleO3LLC::receive(Request& req) {
+  if (req.is_cows_table)   // WI-019 review R2/R7(g): table reads complete at the CoWs token, never here
+    throw std::runtime_error("WI-019 R2: a CoWs table read was routed to SimpleO3LLC::receive()");
   req.mc2llc = m_clk;
   if (req.orig_addr != -1) {   // WI-013: back to the LLC-side address for MSHR matching
     req.addr = req.orig_addr;
@@ -400,7 +412,12 @@ void SimpleO3LLC::evict_line(CacheSet_t& set, CacheSet_t::iterator victim_it) {
     }
 
     Request writeback_req(victim_it->addr, Request::Type::Write);
-    m_miss_list.push_back(std::make_pair(m_clk + m_latency + cows_latency, writeback_req));
+    CoWsCache::TokenPtr tok;
+    if (m_cows_cache != nullptr) {   // WI-019: the writeback waits on the entry's (or the C1 update's) table read
+      tok = m_cows_cache->take_last_token();
+      m_cows_cache->count_data_addr(writeback_req.addr);
+    }
+    m_miss_list.push_back({m_clk + m_latency + cows_latency, writeback_req, tok});
 
     DEBUG_LOG(DSIMPLEO3LLC, m_logger,  "Writeback Request will be issued at Clk={}.", m_clk + m_latency + cows_latency);
   }

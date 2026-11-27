@@ -231,6 +231,38 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
         if (m_cows_cache->m_entries_per_line == 0 || (m_cows_cache->m_entries_per_line & (m_cows_cache->m_entries_per_line - 1)) != 0) {
           throw ConfigurationError("cows_table_entries_per_line must be a power of 2 (got {})", m_cows_cache->m_entries_per_line);
         }
+        {   // WI-019: table reads/writes as real DRAM requests
+          std::string ta = param<std::string>("cows_table_access")
+            .desc("WI-019: fixed (table read = cows_dram_latency_on_translation, no DRAM traffic) | real (DRAM requests)").default_val("fixed");
+          if (ta != "fixed" && ta != "real") throw ConfigurationError("cows_table_access must be fixed or real (got {})", ta);
+          m_cows_cache->m_real_table = ta == "real";
+          if (m_cows_cache->m_real_table) {
+            m_cows_cache->m_table_region = param<int>("cows_table_region")
+              .desc("WI-019: the table occupies physical address bits 31-38 == this value (2GB region, 1024 rows per bank)").required();
+            if (m_cows_cache->m_table_region < 0 || m_cows_cache->m_table_region > 255)
+              throw ConfigurationError("cows_table_region must be in 0..255");
+            std::string tl = param<std::string>("cows_table_layout").desc("WI-019: flat | interleaved table line layout").default_val("flat");
+            if (tl != "flat" && tl != "interleaved") throw ConfigurationError("cows_table_layout must be flat or interleaved (got {})", tl);
+            m_cows_cache->m_table_interleaved = tl == "interleaved";
+            std::cerr << "# CoWs table: real DRAM requests, 2GB table at physical 0x" << std::hex
+                      << ((uint64_t)m_cows_cache->m_table_region << 31) << std::dec << " (region " << m_cows_cache->m_table_region
+                      << " = rows " << m_cows_cache->m_table_region * 1024 << ".." << m_cows_cache->m_table_region * 1024 + 1023
+                      << " of every bank), 16B entry per 4KB frame, 4 per 64B line, layout "
+                      << (m_cows_cache->m_table_interleaved ? "interleaved" : "flat") << std::endl;
+            register_stat(m_cows_cache->s_table_tokens).name("cows_table_read_requests");
+            register_stat(m_cows_cache->s_table_token_joins).name("cows_table_read_joins");
+            register_stat(m_cows_cache->s_table_read_retries).name("cows_table_read_retries");
+            register_stat(m_cows_cache->s_table_write_retries).name("cows_table_write_retries");
+            register_stat(m_cows_cache->s_table_writes_issued).name("cows_table_write_requests");
+            register_stat(m_cows_cache->s_src_rows_moved).name("cows_src_rows_moved");
+            register_stat(m_cows_cache->s_data_in_table_region).name("cows_data_in_table_region");
+            register_stat(m_cows_cache->s_table_reads_done).name("cows_table_reads_done");
+            register_stat(m_cows_cache->s_table_read_e2e_sum).name("cows_table_read_e2e_latency_sum");
+            register_stat(m_cows_cache->s_table_read_e2e_mean).name("cows_table_read_e2e_latency_mean");
+            register_stat(m_cows_cache->s_token_waiters_sum).name("cows_table_read_waiters_sum");
+            register_stat(m_cows_cache->s_token_waiters_mean).name("cows_table_read_waiters_mean");
+          }
+        }
         register_stat(m_cows_cache->s_line_fetches).name("cows_line_fetches");
         register_stat(m_cows_cache->s_line_siblings_present).name("cows_line_siblings_present");
         register_stat(m_cows_cache->s_line_siblings_dropped).name("cows_line_siblings_dropped");
