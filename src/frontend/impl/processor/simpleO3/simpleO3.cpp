@@ -263,6 +263,23 @@ class SimpleO3 final : public IFrontEnd, public Implementation {
             register_stat(m_cows_cache->s_token_waiters_mean).name("cows_table_read_waiters_mean");
           }
         }
+        {   // WI-020: entries covering cows_entry_pages consecutive aligned pages
+          uint32_t e = param<uint32_t>("cows_entry_pages").desc("WI-020: pages covered by one CoWs entry (1, 4 or 8)").default_val(1);
+          if (e != 1 && e != 4 && e != 8) throw ConfigurationError("cows_entry_pages must be 1, 4 or 8 (got {})", e);
+          if (e >= 4 && m_cows_cache->m_table_line_fetch)
+            throw ConfigurationError("cows_table_line_fetch is redundant with cows_entry_pages {} (an entry already covers a table line)", e);
+          m_cows_cache->m_entry_pages = e;
+          m_cows_cache->m_entry_shift = (e == 1) ? 0 : (e == 4 ? 2 : 3);
+          if (e > 1) {
+            std::cerr << "# CoWs entries cover " << e << " consecutive aligned pages (region = page >> " << m_cows_cache->m_entry_shift
+                      << "); " << (e > 4 ? 2 : 1) << " table line(s) per miss" << std::endl;
+            register_stat(m_cows_cache->s_region_evictions).name("cows_region_evictions");
+            register_stat(m_cows_cache->s_region_touched_sum).name("cows_region_touched_pages_sum");
+            register_stat(m_cows_cache->s_region_dirty_line_writes).name("cows_region_dirty_line_writes");
+            for (uint32_t k = 0; k <= e; k++)
+              register_stat(m_cows_cache->s_region_touched_hist[k]).name("cows_region_touched_{}", k);
+          }
+        }
         register_stat(m_cows_cache->s_line_fetches).name("cows_line_fetches");
         register_stat(m_cows_cache->s_line_siblings_present).name("cows_line_siblings_present");
         register_stat(m_cows_cache->s_line_siblings_dropped).name("cows_line_siblings_dropped");

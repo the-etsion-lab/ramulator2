@@ -78,8 +78,9 @@ CoWsCache::Line::toString() const
     return oss.str();
 }
 
-std::tuple<bool,bool,bool> CoWsCache::LRU_nohit::llc_hit(CacheSet_t& set, Line* page, uint32_t block_idx, bool is_write) const
+std::tuple<bool,bool,bool> CoWsCache::LRU_nohit::llc_hit(CacheSet_t& set, Line* page, uint32_t block_idx, bool is_write, Line* bits) const
 {
+    Line* b = bits ? bits : page;   // WI-020: written bits / dirty go to the page's Line; presence / LRU to the entry (page == entry for E = 1)
     // on writes we access the mapping in the cows cache to update the block map, so we need it.
 
     // miss? get the page's cows entry from memory
@@ -104,16 +105,17 @@ std::tuple<bool,bool,bool> CoWsCache::LRU_nohit::llc_hit(CacheSet_t& set, Line* 
     }
 
     // a write and block bit not set? set it and mark the entry dirty
-    if(!miss_not_handled && is_write && !page->getBlockID(block_idx)) {
-        page->setBlockID(block_idx, true);
-        page->setDirty(true);
+    if(!miss_not_handled && is_write && !b->getBlockID(block_idx)) {
+        b->setBlockID(block_idx, true);
+        b->setDirty(true);
     }
 
     return {miss, need_evict, miss_not_handled};
 }
 
-std::tuple<bool,bool,bool> CoWsCache::LRU_nohit::llc_miss(CacheSet_t& set, Line* page, uint32_t block_idx, bool is_write) const
+std::tuple<bool,bool,bool> CoWsCache::LRU_nohit::llc_miss(CacheSet_t& set, Line* page, uint32_t block_idx, bool is_write, Line* bits) const
 {
+    Line* b = bits ? bits : page;   // WI-020: written bits / dirty go to the page's Line; presence / LRU to the entry (page == entry for E = 1)
     auto tag = page->getTag();
     bool miss = false;
     bool miss_not_handled = false;
@@ -137,16 +139,17 @@ std::tuple<bool,bool,bool> CoWsCache::LRU_nohit::llc_miss(CacheSet_t& set, Line*
     // we fetched the page rename data into the cache
     // on a write miss we need to make sure the the block is now renamed and set it dirty
     // on a read miss, no bits need updating.
-    if(!miss_not_handled && is_write && !page->getBlockID(block_idx)) {
-        page->setBlockID(block_idx, true);
-        page->setDirty(true);
+    if(!miss_not_handled && is_write && !b->getBlockID(block_idx)) {
+        b->setBlockID(block_idx, true);
+        b->setDirty(true);
     }
 
     return {miss, need_evict, miss_not_handled};
 }
 
-std::tuple<bool,bool,bool> CoWsCache::LRU_nohit::llc_evict(CacheSet_t& set, Line* page, uint32_t block_idx, bool is_write) const
+std::tuple<bool,bool,bool> CoWsCache::LRU_nohit::llc_evict(CacheSet_t& set, Line* page, uint32_t block_idx, bool is_write, Line* bits) const
 {
+    Line* b = bits ? bits : page;   // WI-020: written bits / dirty go to the page's Line; presence / LRU to the entry (page == entry for E = 1)
     auto tag = page->getTag();
     bool miss = false;
     bool miss_not_handled = false;
@@ -168,9 +171,9 @@ std::tuple<bool,bool,bool> CoWsCache::LRU_nohit::llc_evict(CacheSet_t& set, Line
 
     // WI-004 D2: a dirty LLC writeback is the moment the block reaches the (new) page in DRAM: set its bit.
     // Done even if the entry could not be installed (C1): the entry is fetched and updated in the table anyway.
-    if(is_write && !page->getBlockID(block_idx)) {
-        page->setBlockID(block_idx, true);
-        page->setDirty(true);
+    if(is_write && !b->getBlockID(block_idx)) {
+        b->setBlockID(block_idx, true);
+        b->setDirty(true);
         m_cows_cache->s_bits_set++;
     }
 
@@ -247,7 +250,8 @@ CoWsCache::CoWsCache(uint32_t nlines,
 
 void CoWsCache::set_source_index_bits(uint32_t src_index_bits) {
     s_src_index_bits = src_index_bits;
-    s_entry_bits = Line::getTagBits() + src_index_bits + 1 + AddrParser::getNumBlocksPerPage();
+    // WI-020: a region entry has one tag (log2 E bits shorter) and per page: source index, source valid, bitmap
+    s_entry_bits = Line::getTagBits() - m_entry_shift + m_entry_pages * (src_index_bits + 1 + AddrParser::getNumBlocksPerPage());
     s_cache_bytes = ((uint64_t)m_nsets * m_assoc * s_entry_bits + 7) / 8;
     if (m_table_line_fetch) {   // WI-015 T1 (PI): tagless table entries, cows_table_entries_per_line per 64B table line
         std::cerr << "# COWs table-line fetch: " << m_entries_per_line << " entries per 64B table line (cache entry " << s_entry_bits
@@ -399,10 +403,68 @@ CoWsCache::TokenPtr CoWsCache::table_read(Addr_t page_num, bool demand) {
         s_token_waiters_mean = (float)s_token_waiters_sum / s_table_reads_done;
         auto pit = m_pending_table.find(a);
         if (pit != m_pending_table.end() && pit->second == t) m_pending_table.erase(pit);
+        for (auto& wp : t->parents) {   // WI-020: a combined token is done when all its parts are
+            auto p = wp.lock();
+            if (!p || p->done) continue;
+            bool all = true;
+            for (auto& q : p->parts) all = all && q->done;
+            if (!all) continue;
+            p->done = true;
+            p->done_clk = m_now;
+            for (Line* l : p->lines) if (l->tok == p) l->setWhenReady(m_now);
+            m_token_waiters_hist[p->waiters]++;
+        }
     });
     r.is_cows_table = true;
     m_table_queue.push_back(r);
     return t;
+}
+
+CoWsCache::Line* CoWsCache::region_line(Addr_t page_num) {   // WI-020
+    Addr_t g = page_num >> m_entry_shift;
+    auto it = m_region_lines.find(g);
+    if (it != m_region_lines.end()) return &it->second;
+    Line& l = m_region_lines[g];
+    l.setPageAddr(g << AddrParser::getDramPageBits());   // set / tag from g
+    l.setValid(true);
+    return &l;
+}
+
+void CoWsCache::evict_region(Line* v) {   // WI-020 review Z1/Z2/Z5: write only the dirty covered table lines; touched-pages histogram
+    Addr_t g = v->pageAddr() >> AddrParser::getDramPageBits();
+    Addr_t base = g << m_entry_shift;
+    bool line_dirty[2] = {false, false};
+    for (Addr_t q = base; q < base + m_entry_pages; q++) {
+        auto it = m_perfect_cache.find(q << AddrParser::getDramPageBits());
+        if (it != m_perfect_cache.end() && it->second.isDirty()) {
+            it->second.setDirty(false);
+            line_dirty[(q - base) >> 2] = true;
+        }
+    }
+    for (int k = 0; k < 2; k++) {
+        if (!line_dirty[k]) continue;
+        s_table_writes++;
+        s_region_dirty_line_writes++;
+        if (m_real_table) table_write(base + 4 * k);
+    }
+    uint32_t n = __builtin_popcount(v->touched_mask);
+    s_region_touched_hist[std::min<uint32_t>(n, 8)]++;
+    s_region_touched_sum += n;
+    s_region_evictions++;
+    v->touched_mask = 0;
+}
+
+CoWsCache::TokenPtr CoWsCache::region_table_read(Addr_t page_num) {
+    if (m_entry_pages <= 4) return table_read(page_num, true);   // E = 4: the aligned 4 pages are exactly one table line
+    Addr_t base = (page_num >> m_entry_shift) << m_entry_shift;
+    auto t1 = table_read(base, true), t2 = table_read(base + 4, true);
+    auto p = std::make_shared<TableToken>();
+    p->created_clk = m_now;
+    p->parts = {t1, t2};
+    t1->parents.push_back(p);
+    t2->parents.push_back(p);
+    if (t1->done && t2->done) { p->done = true; p->done_clk = m_now; }
+    return p;
 }
 
 void CoWsCache::table_attach(Line* line, const TokenPtr& t) {
@@ -459,6 +521,7 @@ std::tuple<bool, CoWsCache::Line*> CoWsCache::perfect_cache_lookup(Addr_t page_a
 // this function is here as a placeholder for collecting statistics and calling the ReplPolicy hit method
 std::tuple<bool, uint32_t, bool> CoWsCache::llc_hit(Addr_t baddr, bool is_write, Clk_t clk, int total_llc_misses)
 {
+    if (m_entry_pages > 1 && is_write) throw std::runtime_error("WI-020: llc_hit (unused today) is not region-aware");
     // on read hit we don't need to access the cows cache at all.
     if(!is_write) {
         return {true, 0, false};
@@ -570,6 +633,11 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_miss(Addr_t baddr, bool is_write
 
     // get page data from main db
     auto [perf_miss, page] = perfect_cache_lookup(page_addr);
+    Line* entry = page;   // WI-020: the CoWs-cache entry (the region Line for E > 1)
+    if (m_entry_pages > 1) {
+        entry = region_line(page_num);
+        set_idx = entry->getSetID();
+    }
 
     //
     // now update the real cache we had a miss
@@ -578,7 +646,7 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_miss(Addr_t baddr, bool is_write
 
     // WI-004 D2: an LLC write miss is a write-allocate *fill* (a read of the block); the bit is set only when the dirty
     // line is written back (llc_evict). is_write is used for stats only.
-    auto [cows_cache_miss, cows_cache_evicted, miss_not_handled] = m_policy->llc_miss(set, page, block_idx, false);
+    auto [cows_cache_miss, cows_cache_evicted, miss_not_handled] = m_policy->llc_miss(set, entry, block_idx, false, page);
     if(is_write && !miss_not_handled) {
         s_lookups_write_alloc++;
     }
@@ -589,6 +657,10 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_miss(Addr_t baddr, bool is_write
         return {true, 0, true}; // treat it as a miss, but return the latency of just accessing the cows cache. The caller should retry this access later.
     }
     s_cows_cycles_self += m_access_latency;   // WI-004 C2: handled lookups only
+    if (m_entry_pages > 1) {
+        entry->touched_mask |= 1u << (page_num & (m_entry_pages - 1));   // WI-020 Z5: covered pages touched while resident
+        if (page->getPending()) throw std::runtime_error("WI-020 Z1: a non-head page Line is pending");
+    }
     if(!cows_cache_miss && page->prefetched) {   // WI-015: the sibling fetched with a table line saved a table read
         page->prefetched = false;
         s_prefetch_useful++;
@@ -608,17 +680,17 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_miss(Addr_t baddr, bool is_write
     m_stats_set_access[set_idx]++;
 
     // hit-under-miss?
-    if(!cows_cache_miss && !page->checkIfReady(clk)) {   // WI-004 C2: ready iff clk >= ready_clk
+    if(!cows_cache_miss && !entry->checkIfReady(clk)) {   // WI-004 C2: ready iff clk >= ready_clk
         cows_cache_miss = true;
-        if(page->getWhenReady() <= clk) {
-            fprintf(stderr, "Error: page should not be ready yet. clk=%lu, when_ready=%lu\n", clk, page->getWhenReady());
+        if(entry->getWhenReady() <= clk) {
+            fprintf(stderr, "Error: page should not be ready yet. clk=%lu, when_ready=%lu\n", clk, entry->getWhenReady());
         }
-        assert(page->getWhenReady() > clk);
-        if (m_real_table && page->tok && !page->tok->done) {   // WI-019 R1/R4: wait on the in-flight table read, never NOT_READY - clk
+        assert(entry->getWhenReady() > clk);
+        if (m_real_table && entry->tok && !entry->tok->done) {   // WI-019 R1/R4: wait on the in-flight table read, never NOT_READY - clk
             latency = m_access_latency;
-            m_last_token = page->tok;
+            m_last_token = entry->tok;
         } else {
-            latency = std::max<Clk_t>(m_access_latency, page->getWhenReady() - clk);   // WI-004 C2
+            latency = std::max<Clk_t>(m_access_latency, entry->getWhenReady() - clk);   // WI-004 C2
         }
 
         s_half_misses_on_llc_miss++;
@@ -632,16 +704,16 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_miss(Addr_t baddr, bool is_write
 
         track_misses(clk, total_llc_misses);
 
-        s_table_reads++;   // WI-004 D3
+        s_table_reads += (m_entry_pages > 4) ? 2 : 1;   // WI-004 D3; WI-020: E = 8 reads 2 table lines
         if (m_real_table) {   // WI-019 R4: no fixed latency; the entry and the LLC request wait on the table read
-            m_last_token = table_read(page_num, true);
-            table_attach(page, m_last_token);
+            m_last_token = region_table_read(page_num);
+            table_attach(entry, m_last_token);
         } else {
             latency += get_dram_latency_on_translation(page_num);
-            page->setWhenReady(clk + latency);
+            entry->setWhenReady(clk + latency);
         }
-        page->setPending(true);
-        m_pending_lines.push_back(page);
+        entry->setPending(true);
+        m_pending_lines.push_back(entry);
         if(m_table_line_fetch) {   // WI-015
             fetch_line_siblings(page_num, m_real_table ? NOT_READY : clk + latency, false);
         }
@@ -669,6 +741,11 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_evict(Addr_t baddr, bool evict_d
     uint32_t latency = 0;
 
     auto [perf_miss, page] = perfect_cache_lookup(page_addr);
+    Line* entry = page;   // WI-020: the CoWs-cache entry (the region Line for E > 1)
+    if (m_entry_pages > 1) {
+        entry = region_line(page_num);
+        set_idx = entry->getSetID();
+    }
 
     //
     // now update the real cache we had a miss
@@ -677,7 +754,7 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_evict(Addr_t baddr, bool evict_d
 
     auto& set = m_cache_sets[set_idx];   // WI-004 D1: the real set, not a copy
 
-    auto [cows_cache_miss, cows_cache_evicted, miss_not_handled] = m_policy->llc_evict(set, page, block_idx, evict_dirty);
+    auto [cows_cache_miss, cows_cache_evicted, miss_not_handled] = m_policy->llc_evict(set, entry, block_idx, evict_dirty, page);
     if(miss_not_handled) {
         s_miss_not_handled++;
         s_miss_not_handled_on_llc_evict++;
@@ -695,6 +772,10 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_evict(Addr_t baddr, bool evict_d
         return {true, latency, true};
     }
     s_cows_cycles_self += m_access_latency;   // WI-004 C2: handled lookups only
+    if (m_entry_pages > 1) {
+        entry->touched_mask |= 1u << (page_num & (m_entry_pages - 1));   // WI-020 Z5: covered pages touched while resident
+        if (page->getPending()) throw std::runtime_error("WI-020 Z1: a non-head page Line is pending");
+    }
     if(!cows_cache_miss && page->prefetched) {   // WI-015: the sibling fetched with a table line saved a table read
         page->prefetched = false;
         s_prefetch_useful++;
@@ -714,14 +795,14 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_evict(Addr_t baddr, bool evict_d
     m_stats_set_access[set_idx]++;
 
     // hit-under-miss?
-    if(!cows_cache_miss && !page->checkIfReady(clk)) {   // WI-004 C2: ready iff clk >= ready_clk
+    if(!cows_cache_miss && !entry->checkIfReady(clk)) {   // WI-004 C2: ready iff clk >= ready_clk
         cows_cache_miss = true;
-        assert(page->getWhenReady() > clk);
-        if (m_real_table && page->tok && !page->tok->done) {   // WI-019 R1/R4: wait on the in-flight table read, never NOT_READY - clk
+        assert(entry->getWhenReady() > clk);
+        if (m_real_table && entry->tok && !entry->tok->done) {   // WI-019 R1/R4: wait on the in-flight table read, never NOT_READY - clk
             latency = m_access_latency;
-            m_last_token = page->tok;
+            m_last_token = entry->tok;
         } else {
-            latency = std::max<Clk_t>(m_access_latency, page->getWhenReady() - clk);   // WI-004 C2
+            latency = std::max<Clk_t>(m_access_latency, entry->getWhenReady() - clk);   // WI-004 C2
         }
 
         s_half_misses_on_llc_evict++;
@@ -735,16 +816,16 @@ std::tuple<bool, uint32_t, bool> CoWsCache::llc_evict(Addr_t baddr, bool evict_d
 
         track_misses(clk, total_llc_misses);
 
-        s_table_reads++;   // WI-004 D3
+        s_table_reads += (m_entry_pages > 4) ? 2 : 1;   // WI-004 D3; WI-020: E = 8 reads 2 table lines
         if (m_real_table) {   // WI-019 R4: no fixed latency; the entry and the LLC request wait on the table read
-            m_last_token = table_read(page_num, true);
-            table_attach(page, m_last_token);
+            m_last_token = region_table_read(page_num);
+            table_attach(entry, m_last_token);
         } else {
             latency += get_dram_latency_on_translation(page_num);
-            page->setWhenReady(clk + latency);
+            entry->setWhenReady(clk + latency);
         }
-        page->setPending(true);
-        m_pending_lines.push_back(page);
+        entry->setPending(true);
+        m_pending_lines.push_back(entry);
         if(m_table_line_fetch) {   // WI-015
             fetch_line_siblings(page_num, m_real_table ? NOT_READY : clk + latency, true);
         }

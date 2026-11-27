@@ -97,6 +97,8 @@ public:
         Clk_t created_clk = 0;      // end-to-end latency = done_clk - created_clk (incl. back-pressure wait before the controller)
         std::vector<Line*> lines;   // CoWs entries made ready at completion (only if their tok is still this token)
         uint32_t waiters = 0;       // LLC requests (fills / writebacks) that waited on it
+        std::vector<std::shared_ptr<TableToken>> parts;     // WI-020: a combined token (E=8: 2 table lines) is done when all parts are
+        std::vector<std::weak_ptr<TableToken>> parents;     // WI-020: combined tokens waiting on this one
     };
     using TokenPtr = std::shared_ptr<TableToken>;
     static constexpr Clk_t NOT_READY = std::numeric_limits<Clk_t>::max() / 4;   // whenReady of an entry whose table read is in flight
@@ -106,6 +108,7 @@ public:
         static const uint32_t PHYS_ADDRESS_SPACE_BITS = 52; // ARMv8.2 supports a 52b physical address space
         TokenPtr tok;   // WI-019: the table read this entry waits on (real mode); null in fixed mode
         Addr_t pageAddr() const { return page_phys_addr; }   // WI-019
+        uint32_t touched_mask = 0;   // WI-020 (region entries): covered pages looked up while this entry is resident (review Z5)
         static uint64_t bytes_per_line;
 
         static inline uint32_t getDataBitSize() {
@@ -268,9 +271,9 @@ public:
         // bool 1: hit/miss in the cows_cache
         // bool 2: was a block evicted from the cows_cache
         // bool 3: unhandled_miss: whether the miss was handled (e.g., if all lines in the set are pending, the miss cannot be handled and should be retried later)
-        virtual std::tuple<bool,bool,bool> llc_hit(CacheSet_t& set, Line* page, uint32_t block_id, bool is_write) const = 0;
-        virtual std::tuple<bool,bool,bool> llc_miss(CacheSet_t& set, Line* page, uint32_t block_id, bool is_write) const = 0;
-        virtual std::tuple<bool,bool,bool> llc_evict(CacheSet_t& set, Line* page, uint32_t block_id, bool is_write) const = 0;
+        virtual std::tuple<bool,bool,bool> llc_hit(CacheSet_t& set, Line* page, uint32_t block_id, bool is_write, Line* bits = nullptr) const = 0;
+        virtual std::tuple<bool,bool,bool> llc_miss(CacheSet_t& set, Line* page, uint32_t block_id, bool is_write, Line* bits = nullptr) const = 0;
+        virtual std::tuple<bool,bool,bool> llc_evict(CacheSet_t& set, Line* page, uint32_t block_id, bool is_write, Line* bits = nullptr) const = 0;
 
         protected:
         virtual CacheSet_t::iterator victim(CacheSet_t& set) const {
@@ -311,6 +314,7 @@ public:
                 auto victim = *it;
                 set.erase(it);
                 set.push_back(page);
+                if (m_cows_cache->m_entry_pages > 1) m_cows_cache->evict_region(victim);   // WI-020: region dirty = OR of its pages (Z1/Z2)
                 if(victim->prefetched) {   // WI-015: a table-line sibling evicted before any use
                     victim->prefetched = false;
                     m_cows_cache->s_prefetch_evicted_unused++;
@@ -364,9 +368,9 @@ public:
     class LRU_nohit : public ReplPolicy  {
         public:
         virtual std::string name() const override { return "LRU_nohit"; }
-        std::tuple<bool,bool,bool> llc_hit(CacheSet_t& set, Line* page, uint32_t block_id, bool is_write) const override;
-        std::tuple<bool,bool,bool> llc_miss(CacheSet_t& set, Line* page, uint32_t block_id, bool is_write) const override;
-        std::tuple<bool,bool,bool> llc_evict(CacheSet_t& set, Line* page, uint32_t block_id, bool is_write) const override;
+        std::tuple<bool,bool,bool> llc_hit(CacheSet_t& set, Line* page, uint32_t block_id, bool is_write, Line* bits = nullptr) const override;
+        std::tuple<bool,bool,bool> llc_miss(CacheSet_t& set, Line* page, uint32_t block_id, bool is_write, Line* bits = nullptr) const override;
+        std::tuple<bool,bool,bool> llc_evict(CacheSet_t& set, Line* page, uint32_t block_id, bool is_write, Line* bits = nullptr) const override;
     };
 
 private:
@@ -554,6 +558,17 @@ public:
     void issue_table_requests(IMemorySystem* ms);
     TokenPtr take_last_token() { TokenPtr t = std::move(m_last_token); m_last_token.reset(); return t; }
     void count_data_addr(Addr_t addr) { if (in_table_region(addr)) s_data_in_table_region++; }
+
+    // WI-020: entries covering cows_entry_pages (E = 1, 4, 8) consecutive aligned pages. Region g = page >> log2(E) gives the set and
+    // tag; the entry is a separate Line per region (no Lines for untouched covered pages, review Z3); per-page state (bitmap, dirty,
+    // source) stays in each page's own Line. E = 1 uses the page Line itself (today's code path).
+    uint32_t m_entry_pages = 1, m_entry_shift = 0;
+    std::unordered_map<Addr_t, Line> m_region_lines;
+    uint64_t s_region_evictions = 0, s_region_touched_sum = 0, s_region_dirty_line_writes = 0;
+    uint64_t s_region_touched_hist[9] = {0};   // covered pages touched while resident, at eviction (index = popcount, E <= 8)
+    Line* region_line(Addr_t page_num);
+    void evict_region(Line* victim);
+    TokenPtr region_table_read(Addr_t page_num);   // E <= 4: the one table line; E = 8: a combined token over 2 lines
 private:
     void track_misses(Clk_t clk, int total_llc_misses) {
         static Clk_t last_print = 0;
