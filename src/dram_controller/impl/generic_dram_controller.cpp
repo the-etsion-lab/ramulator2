@@ -122,8 +122,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     bool m_pick_bypass = false;   // this tick's request was chosen by the bypass branch
     uint64_t s_drain_bypasses = 0, s_drain_bypass_pre = 0, s_drain_bypass_act = 0;   // review D2: bypasses whose command is PRE / ACT
     uint64_t s_drain_blocked_cap = 0, s_drain_blocked_k = 0;
-    uint64_t s_drain_bypass_vetoed = 0;
-    uint64_t s_prio_blocked_ticks = 0, s_prio_blocked_demand_ticks = 0;
+    uint64_t s_drain_bypass_vetoed = 0;   // bypass picks vetoed by the 2.3 closing check (the tick issues nothing)
+    uint64_t s_prio_blocked_ticks = 0, s_prio_blocked_demand_ticks = 0;   // WI-026 review D2: ticks lost to a not-ready priority head
     // WI-026 diagnostic (stats only): read-buffer pressure while some rank of this channel is in all-bank refresh (REFab issued
     // < nRFC1 ago, tracked from issued commands) vs not.
     std::vector<Clk_t> m_ref_end;   // per rank
@@ -132,7 +132,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     uint64_t s_rd_on_ref_rank = 0;   // sum over ticks of reads in the read buffer that target a rank in refresh
     uint64_t s_rd_refused_ref = 0, s_rd_refused_noref = 0;
     // per DRAM-served read: accepted while ITS rank was in refresh (count, latency sum) vs not
-    uint64_t s_rd_arr_ref_n = 0, s_rd_arr_ref_lat = 0, s_rd_arr_noref_n = 0, s_rd_arr_noref_lat = 0;   // WI-026 review D2: ticks lost to a not-ready priority head   // bypass picks vetoed by the 2.3 closing check (the tick issues nothing)
+    uint64_t s_rd_arr_ref_n = 0, s_rd_arr_ref_lat = 0, s_rd_arr_noref_n = 0, s_rd_arr_noref_lat = 0;
     uint64_t s_write_refusals = 0, s_write_buffer_hwm = 0, s_write_lat_sum = 0, s_writes_issued = 0;   // review D1, write latency
 
     std::string m_controller_stats_name;
@@ -234,7 +234,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       m_dram = memory_system->get_ifce<IDRAM>();
       m_bank_addr_idx = m_dram->m_levels("bank");
       m_rank_idx = m_dram->m_levels("rank");
-      m_cmd_refab = m_dram->m_commands("REFab"); m_ref_end.assign(m_dram->get_level_size("rank"), -1);   // WI-026 diagnostic m_cmd_act = m_dram->m_commands("ACT"); m_cmd_rd = m_dram->m_commands("RD");   // WI-022
+      m_cmd_act = m_dram->m_commands("ACT"); m_cmd_rd = m_dram->m_commands("RD");   // WI-022
+      m_cmd_refab = m_dram->m_commands("REFab"); m_ref_end.assign(m_dram->get_level_size("rank"), -1);   // WI-026 diagnostic
 
       m_auto_precharge = param<bool>("auto_precharge")
         .desc("Strict closed-row: serve every read/write with RDA/WRA (auto-precharge).").default_val(false);
