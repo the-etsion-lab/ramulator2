@@ -47,6 +47,7 @@ struct Request {
   // WI-022 (stats only): a table read's wait before its first command, by cause (controller ticks), and its first-command clock
   uint32_t cows_wait_wm = 0, cows_wait_busy = 0, cows_wait_notready = 0, cows_wait_ready = 0, cows_wait_nr_bank = 0;
   Clk_t cows_first_cmd = -1;
+  bool refdiag_rank_in_refresh = false;   // WI-026 diagnostic (stats only): its rank was in all-bank refresh when it arrived
 
   Clk_t core2llc = -1;   // Clock cycle when the request arrives at LLC
   Clk_t arrive = -1;   // Clock cycle when the request arrive at the memory controller

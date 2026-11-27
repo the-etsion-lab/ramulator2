@@ -130,7 +130,9 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     int m_cmd_refab = -1;
     uint64_t s_rd_ref_ticks = 0, s_rd_occ_ref = 0, s_rd_occ_noref = 0, s_rd_full_ref = 0, s_rd_full_noref = 0;
     uint64_t s_rd_on_ref_rank = 0;   // sum over ticks of reads in the read buffer that target a rank in refresh
-    uint64_t s_rd_refused_ref = 0, s_rd_refused_noref = 0;   // WI-026 review D2: ticks lost to a not-ready priority head   // bypass picks vetoed by the 2.3 closing check (the tick issues nothing)
+    uint64_t s_rd_refused_ref = 0, s_rd_refused_noref = 0;
+    // per DRAM-served read: accepted while ITS rank was in refresh (count, latency sum) vs not
+    uint64_t s_rd_arr_ref_n = 0, s_rd_arr_ref_lat = 0, s_rd_arr_noref_n = 0, s_rd_arr_noref_lat = 0;   // WI-026 review D2: ticks lost to a not-ready priority head   // bypass picks vetoed by the 2.3 closing check (the tick issues nothing)
     uint64_t s_write_refusals = 0, s_write_buffer_hwm = 0, s_write_lat_sum = 0, s_writes_issued = 0;   // review D1, write latency
 
     std::string m_controller_stats_name;
@@ -291,6 +293,10 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       register_stat(s_rd_on_ref_rank).name("refdiag_rd_on_refreshing_rank_sum_{}", m_channel_id);
       register_stat(s_rd_refused_ref).name("refdiag_read_refusals_refresh_{}", m_channel_id);
       register_stat(s_rd_refused_noref).name("refdiag_read_refusals_norefresh_{}", m_channel_id);
+      register_stat(s_rd_arr_ref_n).name("refdiag_reads_own_rank_refreshing_{}", m_channel_id);
+      register_stat(s_rd_arr_ref_lat).name("refdiag_read_latency_sum_own_rank_refreshing_{}", m_channel_id);
+      register_stat(s_rd_arr_noref_n).name("refdiag_reads_own_rank_not_refreshing_{}", m_channel_id);
+      register_stat(s_rd_arr_noref_lat).name("refdiag_read_latency_sum_own_rank_not_refreshing_{}", m_channel_id);
       register_stat(s_queue_len_avg).name("queue_len_avg_{}", m_channel_id);
       register_stat(s_read_queue_len_avg).name("read_queue_len_avg_{}", m_channel_id);
       register_stat(s_write_queue_len_avg).name("write_queue_len_avg_{}", m_channel_id);
@@ -401,6 +407,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       bool is_success = false;
       req.arrive = m_clk;
       if        (req.type_id == Request::Type::Read) {
+        { int rk = req.addr_vec[m_rank_idx];   // WI-026 diagnostic: was this read's own rank in refresh on arrival?
+          req.refdiag_rank_in_refresh = rk >= 0 && m_clk < m_ref_end[rk]; }
         is_success = m_read_buffer.enqueue(req);
       } else if (req.type_id == Request::Type::Write) {
         is_success = m_write_buffer.enqueue(req);
@@ -699,6 +707,10 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
             m_dram_latency_samples.push_back(std::make_tuple(req.addr, req.depart - req.arrive));
             m_total_latency_samples.push_back(std::make_tuple(req.addr, req.depart - req.core2llc));
             s_read_latency += req.depart - req.arrive;
+            if (req.type_id == Request::Type::Read) {   // WI-026 diagnostic
+              if (req.refdiag_rank_in_refresh) { s_rd_arr_ref_n++; s_rd_arr_ref_lat += req.depart - req.arrive; }
+              else { s_rd_arr_noref_n++; s_rd_arr_noref_lat += req.depart - req.arrive; }
+            }
             if (m_cows_table) {   // WI-019: table vs ordinary (data) read latency
               uint64_t lat = req.depart - req.arrive;
               if (req.is_cows_table) {
