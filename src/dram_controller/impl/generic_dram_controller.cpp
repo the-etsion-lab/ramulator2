@@ -104,7 +104,14 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     };
     LatHist m_tw, m_tw_wm, m_tw_rm, m_tw_busy, m_tsvc;
     uint64_t s_tw_notready = 0, s_tw_ready = 0, s_tw_busy_pre_ready = 0, s_tw_nr_bank = 0;
-    uint64_t s_tw_nr_level[3] = {0, 0, 0};   // notready ticks blocked at level 0..2 (channel / rank / bankgroup), non-exclusive
+    uint64_t s_tw_nr_level[3] = {0, 0, 0};
+    // PI 2026-11-28: cause of rank-level blocking, reconstructed from this channel's issued commands per rank (stats only).
+    // First match: refresh (REFab/RFMab within nRFC1/nRFM1) > tFAW (4th-last ACT + nFAW) > tRRD_S (last ACT + nRRDS) >
+    // write->read turnaround (RD blocked within nCCDS_WTR of the rank's last WR/WRA) > other (tCCD_S, sibling-rank, PREA).
+    struct RankHist { Clk_t ref_end = -1; Clk_t act[4] = {-1, -1, -1, -1}; int act_i = 0; Clk_t last_wr = -1; };
+    std::map<int, RankHist> m_rank_hist;
+    int m_rank_idx = -1, m_cmd_act = -1, m_cmd_rd = -1;
+    uint64_t s_tw_rank_cause[5] = {0, 0, 0, 0, 0};   // notready ticks blocked at level 0..2 (channel / rank / bankgroup), non-exclusive
     LatHist m_tw_occ;   // review H1: target bank occupied = bank_busy + notready blocked at the bank level
     // WI-021 `first_drain`: a ready table read may bypass a write drain, while (a) the write buffer is below kWriteBypassLimit
     // (= max_size; ReqBuffer::enqueue accepts up to max_size + 1, so this is a slightly conservative hard limit) and (b) fewer than
@@ -216,6 +223,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     void setup(IFrontEnd* frontend, IMemorySystem* memory_system) override {
       m_dram = memory_system->get_ifce<IDRAM>();
       m_bank_addr_idx = m_dram->m_levels("bank");
+      m_rank_idx = m_dram->m_levels("rank"); m_cmd_act = m_dram->m_commands("ACT"); m_cmd_rd = m_dram->m_commands("RD");   // WI-022
 
       m_auto_precharge = param<bool>("auto_precharge")
         .desc("Strict closed-row: serve every read/write with RDA/WRA (auto-precharge).").default_val(false);
@@ -312,6 +320,9 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
           register_stat(s_tw_busy_pre_ready).name("table_read_wait_bank_busy_pre_ready_sum_{}", m_channel_id);
           for (int l = 0; l < m_bank_addr_idx && l < 3; l++)
             register_stat(s_tw_nr_level[l]).name("table_read_wait_rm_notready_{}_ticks_{}", m_dram->m_levels(l), m_channel_id);
+          const char* rc5[] = {"refresh", "faw", "rrd", "wtr", "other"};
+          for (int k = 0; k < 5; k++)
+            register_stat(s_tw_rank_cause[k]).name("table_read_wait_rm_notready_rank_{}_ticks_{}", rc5[k], m_channel_id);
         }
         register_stat(s_drain_bypasses).name("table_drain_bypasses_{}", m_channel_id);   // WI-021
         register_stat(s_drain_bypass_pre).name("table_drain_bypass_pre_{}", m_channel_id);
@@ -459,6 +470,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
             int bm = m_dram->check_ready_block_mask(pc, r.addr_vec);
             if (bm & (1 << m_bank_addr_idx)) r.cows_wait_nr_bank++;
             for (int l = 0; l < m_bank_addr_idx && l < 3; l++) if (bm & (1 << l)) s_tw_nr_level[l]++;   // non-exclusive
+            if (bm & (1 << m_rank_idx)) s_tw_rank_cause[rank_cause(pc, r.addr_vec[m_rank_idx])]++;
           } else
             r.cows_wait_ready++;
         }
@@ -500,6 +512,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
           update_request_stats(req_it);
         }
         m_dram->issue_command(req_it->command, req_it->addr_vec);
+        if (m_cows_table) note_rank_cmd(req_it->command, req_it->addr_vec);   // WI-022 (stats only)
 
         // If we are issuing the last command, set depart clock cycle and move the request to the pending queue
         if (req_it->command == req_it->final_command) {
@@ -547,6 +560,33 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
      * @details
      *
      */
+    // WI-022 (stats only): per-rank command history for the rank-level cause split
+    void note_rank_cmd(int cmd, const AddrVec_t& av) {
+      int rk = av[m_rank_idx];
+      if (rk < 0) return;
+      auto& h = m_rank_hist[rk];
+      const auto& c = m_dram->m_commands;
+      if (cmd == c("REFab")) h.ref_end = std::max<Clk_t>(h.ref_end, m_clk + m_dram->m_timing_vals("nRFC1"));
+      else if (cmd == c("RFMab")) h.ref_end = std::max<Clk_t>(h.ref_end, m_clk + m_dram->m_timing_vals("nRFM1"));
+      else if (cmd == m_cmd_act) { h.act[h.act_i] = m_clk; h.act_i = (h.act_i + 1) & 3; }
+      else if (cmd == c("WR") || cmd == c("WRA")) h.last_wr = m_clk;
+    }
+    int rank_cause(int pc, int rk) {   // 0 refresh, 1 tFAW, 2 tRRD_S, 3 write->read turnaround, 4 other
+      auto it = m_rank_hist.find(rk);
+      if (it == m_rank_hist.end()) return 4;
+      const auto& h = it->second;
+      if (m_clk < h.ref_end) return 0;
+      if (pc == m_cmd_act) {
+        Clk_t oldest = h.act[h.act_i];   // the 4th-last ACT (ring buffer of 4)
+        if (oldest >= 0 && m_clk < oldest + m_dram->m_timing_vals("nFAW")) return 1;
+        Clk_t last = h.act[(h.act_i + 3) & 3];
+        if (last >= 0 && m_clk < last + m_dram->m_timing_vals("nRRDS")) return 2;
+      } else if (pc == m_cmd_rd || pc == m_dram->m_commands("RDA")) {
+        if (h.last_wr >= 0 && m_clk < h.last_wr + m_dram->m_timing_vals("nCCDS_WTR")) return 3;
+      }
+      return 4;
+    }
+
     void update_request_stats(ReqBuffer::iterator& req)
     {
       req->is_stat_updated = true;
