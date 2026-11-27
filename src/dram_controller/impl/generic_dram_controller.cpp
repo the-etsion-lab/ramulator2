@@ -82,6 +82,16 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     uint64_t s_table_row_rd[3] = {0, 0, 0}, s_table_row_wr[3] = {0, 0, 0};   // hit / miss / conflict at first command
     uint64_t s_table_reads_waited_wm = 0, s_table_wm_cycles = 0;   // review R6: table reads that sat through a write drain
     uint64_t s_table_first_picks = 0;   // `first`: table reads chosen ahead of FR-FCFS
+    // WI-021 `first_drain`: a ready table read may bypass a write drain, while (a) the write buffer is below kWriteBypassLimit
+    // (= max_size; ReqBuffer::enqueue accepts up to max_size + 1, so this is a slightly conservative hard limit) and (b) fewer than
+    // m_drain_bypass_max bypasses happened since the last issued write.
+    bool m_cows_table_drain = false;
+    int m_drain_bypass_max = 4;
+    int m_consec_bypass = 0;
+    bool m_pick_bypass = false;   // this tick's request was chosen by the bypass branch
+    uint64_t s_drain_bypasses = 0, s_drain_bypass_pre = 0, s_drain_bypass_act = 0;   // review D2: bypasses whose command is PRE / ACT
+    uint64_t s_drain_blocked_cap = 0, s_drain_blocked_k = 0;
+    uint64_t s_write_refusals = 0, s_write_buffer_hwm = 0, s_write_lat_sum = 0, s_writes_issued = 0;   // review D1, write latency
 
     std::string m_controller_stats_name;
     std::vector<std::tuple<Addr_t, uint64_t>> m_dram_latency_samples;
@@ -127,9 +137,13 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       {   // WI-019
         std::string tp = param<std::string>("cows_table_priority")
           .desc("WI-019: fcfs | first (table reads ahead of other reads in read mode); empty = no CoWs table requests").default_val("");
-        if (tp != "" && tp != "fcfs" && tp != "first") throw ConfigurationError("cows_table_priority must be fcfs or first (got {})", tp);
+        if (tp != "" && tp != "fcfs" && tp != "first" && tp != "first_drain")
+          throw ConfigurationError("cows_table_priority must be fcfs, first or first_drain (got {})", tp);
         m_cows_table = tp != "";
-        m_cows_table_first = tp == "first";
+        m_cows_table_first = tp == "first" || tp == "first_drain";   // first_drain includes the read-mode priority
+        m_cows_table_drain = tp == "first_drain";   // WI-021
+        m_drain_bypass_max = param<int>("cows_drain_bypass_max")
+          .desc("WI-021: max consecutive table-read bypasses of a write drain without an issued write").default_val(4);
       }
       m_scheduler = create_child_ifce<IScheduler>();
       m_refresh = create_child_ifce<IRefreshManager>();
@@ -190,6 +204,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       m_priority_buffer.max_size = 512*3 + 32;
       m_read_buffer.max_size = param<int>("read_buffer_size")   // WI-019 test (f): a tiny queue forces back-pressure
         .desc("Read buffer capacity (default 32 = the ReqBuffer default).").default_val(32);
+      m_write_buffer.max_size = param<int>("write_buffer_size")   // WI-021 review D3: small-write-buffer stress test
+        .desc("Write buffer capacity (default 32 = the ReqBuffer default).").default_val(32);
 
       m_controller_stats_name += std::to_string(m_channel_id);
 
@@ -254,6 +270,15 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         register_stat(s_table_reads_waited_wm).name("table_reads_waited_write_mode_{}", m_channel_id);
         register_stat(s_table_wm_cycles).name("table_read_write_mode_cycles_{}", m_channel_id);
         register_stat(s_table_first_picks).name("table_first_picks_{}", m_channel_id);
+        register_stat(s_drain_bypasses).name("table_drain_bypasses_{}", m_channel_id);   // WI-021
+        register_stat(s_drain_bypass_pre).name("table_drain_bypass_pre_{}", m_channel_id);
+        register_stat(s_drain_bypass_act).name("table_drain_bypass_act_{}", m_channel_id);
+        register_stat(s_drain_blocked_cap).name("table_drain_blocked_cap_{}", m_channel_id);
+        register_stat(s_drain_blocked_k).name("table_drain_blocked_k_{}", m_channel_id);
+        register_stat(s_write_refusals).name("write_refusals_{}", m_channel_id);
+        register_stat(s_write_buffer_hwm).name("write_buffer_hwm_{}", m_channel_id);
+        register_stat(s_write_lat_sum).name("write_latency_sum_{}", m_channel_id);
+        register_stat(s_writes_issued).name("writes_issued_{}", m_channel_id);
       }
     };
 
@@ -311,8 +336,11 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       if (!is_success) {
         // We could not enqueue the request
         req.arrive = -1;
+        if (m_cows_table && req.type_id == Request::Type::Write) s_write_refusals++;   // WI-021 review D1
         return false;
       }
+      if (m_cows_table && req.type_id == Request::Type::Write)   // WI-021: write-buffer high-water mark
+        s_write_buffer_hwm = std::max<uint64_t>(s_write_buffer_hwm, m_write_buffer.size());
       if (m_cows_table && req.is_cows_table) {   // WI-019: count accepted table requests only (refusals are retried by the CoWs side)
         if (req.type_id == Request::Type::Read) s_table_reads++; else s_table_writes++;
       }
@@ -391,6 +419,18 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         plugin->update(request_found, req_it);
       }
 
+      if (request_found && m_cows_table) {   // WI-021: bypass / write accounting at issue
+        if (m_pick_bypass) {   // chosen by the bypass branch and not vetoed by the closing check
+          s_drain_bypasses++; m_consec_bypass++;
+          const auto& meta = m_dram->m_command_meta(req_it->command);
+          if (meta.is_closing) s_drain_bypass_pre++;
+          if (meta.is_opening) s_drain_bypass_act++;
+        }
+        if (req_it->type_id == Request::Type::Write && m_dram->m_command_meta(req_it->command).is_accessing) {
+          m_consec_bypass = 0;
+          if (req_it->command == req_it->final_command) { s_write_lat_sum += m_clk - req_it->arrive; s_writes_issued++; }
+        }
+      }
       // 4. Finally, issue the commands to serve the request
       if (request_found) {
         // If we find a real request to serve
@@ -572,6 +612,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
      */
     bool schedule_request(ReqBuffer::iterator& req_it, ReqBuffer*& req_buffer) {
       bool request_found = false;
+      m_pick_bypass = false;   // WI-021
       // 2.1    First, check the act buffer to serve requests that are already activating (avoid useless ACTs)
       if (req_it= m_scheduler->get_best_request(m_active_buffer); req_it != m_active_buffer.end()) {
         if (m_dram->check_ready(req_it->command, req_it->addr_vec)) {
@@ -599,7 +640,19 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
           // Query the write policy to decide which buffer to serve
           set_write_mode();
           auto& buffer = m_is_write_mode ? m_write_buffer : m_read_buffer;
-          if (m_cows_table_first && !m_is_write_mode) {   // WI-019 `first`: the oldest table read whose NEXT command is ready
+          if (m_cows_table_drain && m_is_write_mode) {   // WI-021 `first_drain`: a ready table read may bypass the drain
+            for (auto it = m_read_buffer.begin(); it != m_read_buffer.end(); it++) {
+              if (!it->is_cows_table) continue;
+              it->command = m_dram->get_preq_command(it->final_command, it->addr_vec);
+              if (!m_dram->check_ready(it->command, it->addr_vec)) continue;
+              const size_t kWriteBypassLimit = m_write_buffer.max_size;   // rule (a); capacity is max_size + 1
+              if (m_write_buffer.size() >= kWriteBypassLimit) { s_drain_blocked_cap++; break; }
+              if (m_consec_bypass >= m_drain_bypass_max) { s_drain_blocked_k++; break; }   // rule (b)
+              req_it = it; request_found = true; req_buffer = &m_read_buffer; m_pick_bypass = true;
+              break;
+            }
+          }
+          if (!request_found && m_cows_table_first && !m_is_write_mode) {   // WI-019 `first`: the oldest table read whose NEXT command is ready
             for (auto it = m_read_buffer.begin(); it != m_read_buffer.end(); it++) {
               if (!it->is_cows_table) continue;
               it->command = m_dram->get_preq_command(it->final_command, it->addr_vec);
