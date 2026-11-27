@@ -91,6 +91,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     bool m_pick_bypass = false;   // this tick's request was chosen by the bypass branch
     uint64_t s_drain_bypasses = 0, s_drain_bypass_pre = 0, s_drain_bypass_act = 0;   // review D2: bypasses whose command is PRE / ACT
     uint64_t s_drain_blocked_cap = 0, s_drain_blocked_k = 0;
+    uint64_t s_drain_bypass_vetoed = 0;   // bypass picks vetoed by the 2.3 closing check (the tick issues nothing)
     uint64_t s_write_refusals = 0, s_write_buffer_hwm = 0, s_write_lat_sum = 0, s_writes_issued = 0;   // review D1, write latency
 
     std::string m_controller_stats_name;
@@ -275,6 +276,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         register_stat(s_drain_bypass_act).name("table_drain_bypass_act_{}", m_channel_id);
         register_stat(s_drain_blocked_cap).name("table_drain_blocked_cap_{}", m_channel_id);
         register_stat(s_drain_blocked_k).name("table_drain_blocked_k_{}", m_channel_id);
+        register_stat(s_drain_bypass_vetoed).name("table_drain_bypass_vetoed_{}", m_channel_id);
         register_stat(s_write_refusals).name("write_refusals_{}", m_channel_id);
         register_stat(s_write_buffer_hwm).name("write_buffer_hwm_{}", m_channel_id);
         register_stat(s_write_lat_sum).name("write_latency_sum_{}", m_channel_id);
@@ -694,6 +696,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
               if (m_auto_precharge && req_buffer == &m_active_buffer)
                 throw std::runtime_error("auto_precharge: two active-buffer requests share a bank (impossible in strict mode)");
               request_found = false;
+              if (m_pick_bypass) s_drain_bypass_vetoed++;   // WI-021 review note 1
               break;
             }
           }
