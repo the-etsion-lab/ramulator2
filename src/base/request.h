@@ -42,6 +42,8 @@ struct Request {
   int final_command = -1;    // The final command that is needed to finish the request
   bool is_stat_updated = false; // Memory controller stats
   int row_class = -1;           // WI-005: row-buffer outcome at the request's first issued command: 0 hit, 1 miss (bank closed), 2 conflict
+  bool is_cows_table = false;   // WI-019: a CoWs table read/write (cows_table_access: real); only the CoWs cache sets it
+  bool cows_waited_wm = false;  // WI-019: a table read that sat in the read buffer while the controller was in write-drain mode
 
   Clk_t core2llc = -1;   // Clock cycle when the request arrives at LLC
   Clk_t arrive = -1;   // Clock cycle when the request arrive at the memory controller

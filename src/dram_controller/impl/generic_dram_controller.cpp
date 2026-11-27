@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <fstream>
+#include <map>
 
 #include "dram_controller/controller.h"
 #include "memory_system/memory_system.h"
@@ -69,6 +70,19 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     size_t s_read_latency = 0;
     float s_avg_read_latency = 0;
 
+    // WI-019: CoWs table requests. Active only when cows_table_priority is configured (real table access); otherwise nothing is
+    // registered or changed (bit-exact).
+    bool m_cows_table = false;          // cows_table_priority given
+    bool m_cows_table_first = false;    // `first`: oldest issuable table read ahead of FR-FCFS in read mode
+    uint64_t s_table_reads = 0, s_table_writes = 0, s_table_reads_forwarded = 0;
+    uint64_t s_table_read_lat_sum = 0;
+    std::map<uint64_t, uint64_t> m_table_read_lat_hist;
+    float s_table_read_lat_mean = 0, s_table_read_lat_p50 = 0, s_table_read_lat_p90 = 0;
+    uint64_t s_data_reads = 0, s_data_read_lat_sum = 0; float s_data_read_lat_mean = 0;   // non-table reads (DRAM-served)
+    uint64_t s_table_row_rd[3] = {0, 0, 0}, s_table_row_wr[3] = {0, 0, 0};   // hit / miss / conflict at first command
+    uint64_t s_table_reads_waited_wm = 0, s_table_wm_cycles = 0;   // review R6: table reads that sat through a write drain
+    uint64_t s_table_first_picks = 0;   // `first`: table reads chosen ahead of FR-FCFS
+
     std::string m_controller_stats_name;
     std::vector<std::tuple<Addr_t, uint64_t>> m_dram_latency_samples;
     std::vector<std::tuple<Addr_t, uint64_t>> m_total_latency_samples;
@@ -110,6 +124,13 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       m_dump_raw_latency = param<bool>("dump_raw_latency_samples")
         .desc("Write the raw per-request latency sample files (large).").default_val(true);
 
+      {   // WI-019
+        std::string tp = param<std::string>("cows_table_priority")
+          .desc("WI-019: fcfs | first (table reads ahead of other reads in read mode); empty = no CoWs table requests").default_val("");
+        if (tp != "" && tp != "fcfs" && tp != "first") throw ConfigurationError("cows_table_priority must be fcfs or first (got {})", tp);
+        m_cows_table = tp != "";
+        m_cows_table_first = tp == "first";
+      }
       m_scheduler = create_child_ifce<IScheduler>();
       m_refresh = create_child_ifce<IRefreshManager>();
       m_rowpolicy = create_child_ifce<IRowPolicy>();
@@ -149,6 +170,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
 
     void on_reset_stats() override {
       m_read_lat_by_class.clear();   // registered sums/counts are reset by the stats system
+      m_table_read_lat_hist.clear();   // WI-019
     }
 
     void setup(IFrontEnd* frontend, IMemorySystem* memory_system) override {
@@ -166,6 +188,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         m_cmd_RDA = m_dram->m_commands("RDA"); m_cmd_WRA = m_dram->m_commands("WRA");
       }
       m_priority_buffer.max_size = 512*3 + 32;
+      m_read_buffer.max_size = param<int>("read_buffer_size")   // WI-019 test (f): a tiny queue forces back-pressure
+        .desc("Read buffer capacity (default 32 = the ReqBuffer default).").default_val(32);
 
       m_controller_stats_name += std::to_string(m_channel_id);
 
@@ -211,6 +235,26 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         register_stat(s_redirect_rowclass[k]).name("redirected_read_{}_{}", rc_names[k], m_channel_id);
       }
       register_stat(s_avg_read_latency).name("avg_read_latency_{}", m_channel_id);
+      if (m_cows_table) {   // WI-019
+        register_stat(s_table_reads).name("table_reads_{}", m_channel_id);
+        register_stat(s_table_writes).name("table_writes_{}", m_channel_id);
+        register_stat(s_table_reads_forwarded).name("table_reads_forwarded_{}", m_channel_id);
+        register_stat(s_table_read_lat_sum).name("table_read_latency_sum_{}", m_channel_id);
+        register_stat(s_table_read_lat_mean).name("table_read_latency_mean_{}", m_channel_id);
+        register_stat(s_table_read_lat_p50).name("table_read_latency_p50_{}", m_channel_id);
+        register_stat(s_table_read_lat_p90).name("table_read_latency_p90_{}", m_channel_id);
+        register_stat(s_data_reads).name("data_reads_{}", m_channel_id);
+        register_stat(s_data_read_lat_sum).name("data_read_latency_sum_{}", m_channel_id);
+        register_stat(s_data_read_lat_mean).name("data_read_latency_mean_{}", m_channel_id);
+        const char* rc[3] = {"hit", "miss", "conflict"};
+        for (int k = 0; k < 3; k++) {
+          register_stat(s_table_row_rd[k]).name("table_read_row_{}_{}", rc[k], m_channel_id);
+          register_stat(s_table_row_wr[k]).name("table_write_row_{}_{}", rc[k], m_channel_id);
+        }
+        register_stat(s_table_reads_waited_wm).name("table_reads_waited_write_mode_{}", m_channel_id);
+        register_stat(s_table_wm_cycles).name("table_read_write_mode_cycles_{}", m_channel_id);
+        register_stat(s_table_first_picks).name("table_first_picks_{}", m_channel_id);
+      }
     };
 
     bool send(Request& req) override {
@@ -249,6 +293,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
           req.depart = m_clk + 1;
 
           pending.push_back(req);
+          if (m_cows_table && req.is_cows_table) s_table_reads++;   // WI-019: accepted (forwarded) table read
           return true;
         }
       }
@@ -267,6 +312,9 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         // We could not enqueue the request
         req.arrive = -1;
         return false;
+      }
+      if (m_cows_table && req.is_cows_table) {   // WI-019: count accepted table requests only (refusals are retried by the CoWs side)
+        if (req.type_id == Request::Type::Read) s_table_reads++; else s_table_writes++;
       }
 
       return true;
@@ -322,6 +370,9 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       s_write_queue_len += m_write_buffer.size();
       s_priority_queue_len += m_priority_buffer.size();
 
+      if (m_cows_table && m_is_write_mode) {   // WI-019 review R6: table reads waiting through a write drain
+        for (auto& r : m_read_buffer) if (r.is_cows_table) { r.cows_waited_wm = true; s_table_wm_cycles++; }
+      }
       // 1. Serve completed reads
       serve_completed_reads();
 
@@ -398,6 +449,10 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     {
       req->is_stat_updated = true;
 
+      if (m_cows_table && req->is_cows_table) {   // WI-019: row-policy outcome of table requests (also counted below)
+        int k = is_row_hit(req) ? 0 : (is_row_open(req) ? 2 : 1);
+        if (req->type_id == Request::Type::Read) s_table_row_rd[k]++; else s_table_row_wr[k]++;
+      }
       if (req->type_id == Request::Type::Read)
       {
         if (is_row_hit(req)) {
@@ -451,6 +506,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         auto& req = pending[0];
         if (req.depart <= m_clk) {
           // Request received data from dram
+          if (m_cows_table && req.is_cows_table && req.depart - req.arrive <= 1) s_table_reads_forwarded++;   // WI-019
           if (req.depart - req.arrive > 1) {
             // Check if this requests accesses the DRAM or is being forwarded.
             // TODO add the stats back
@@ -463,6 +519,15 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
             m_dram_latency_samples.push_back(std::make_tuple(req.addr, req.depart - req.arrive));
             m_total_latency_samples.push_back(std::make_tuple(req.addr, req.depart - req.core2llc));
             s_read_latency += req.depart - req.arrive;
+            if (m_cows_table) {   // WI-019: table vs ordinary (data) read latency
+              uint64_t lat = req.depart - req.arrive;
+              if (req.is_cows_table) {
+                s_table_read_lat_sum += lat; m_table_read_lat_hist[lat]++;
+                if (req.cows_waited_wm) s_table_reads_waited_wm++;
+              } else {
+                s_data_reads++; s_data_read_lat_sum += lat;
+              }
+            }
             if (req.row_class >= 0) {
               Clk_t lat = req.depart - req.arrive;
               m_read_lat_by_class[lat][req.row_class]++;
@@ -534,9 +599,21 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
           // Query the write policy to decide which buffer to serve
           set_write_mode();
           auto& buffer = m_is_write_mode ? m_write_buffer : m_read_buffer;
-          if (req_it = m_scheduler->get_best_request(buffer); req_it != buffer.end()) {
-            request_found = m_dram->check_ready(req_it->command, req_it->addr_vec);
-            req_buffer = &buffer;
+          if (m_cows_table_first && !m_is_write_mode) {   // WI-019 `first`: the oldest table read whose NEXT command is ready
+            for (auto it = m_read_buffer.begin(); it != m_read_buffer.end(); it++) {
+              if (!it->is_cows_table) continue;
+              it->command = m_dram->get_preq_command(it->final_command, it->addr_vec);
+              if (m_dram->check_ready(it->command, it->addr_vec)) {
+                req_it = it; request_found = true; req_buffer = &m_read_buffer; s_table_first_picks++;
+                break;
+              }
+            }
+          }
+          if (!request_found) {
+            if (req_it = m_scheduler->get_best_request(buffer); req_it != buffer.end()) {
+              request_found = m_dram->check_ready(req_it->command, req_it->addr_vec);
+              req_buffer = &buffer;
+            }
           }
         }
       }
@@ -575,6 +652,17 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
 
     void finalize() override {
       s_avg_read_latency = (float) s_read_latency / (float) s_num_read_reqs;
+      if (m_cows_table) {   // WI-019: table-read latency mean / p50 / p90 (DRAM-served table reads), ordinary-read mean
+        uint64_t n = 0; for (auto& [l, c] : m_table_read_lat_hist) n += c;
+        s_table_read_lat_mean = n ? (float)s_table_read_lat_sum / n : 0;
+        uint64_t acc = 0; bool p50 = false;
+        for (auto& [l, c] : m_table_read_lat_hist) {
+          acc += c;
+          if (!p50 && acc * 2 >= n) { s_table_read_lat_p50 = l; p50 = true; }
+          if (acc * 10 >= n * 9) { s_table_read_lat_p90 = l; break; }
+        }
+        s_data_read_lat_mean = s_data_reads ? (float)s_data_read_lat_sum / s_data_reads : 0;
+      }
 
       s_queue_len_avg = (float) s_queue_len / (float) m_clk;
       s_read_queue_len_avg = (float) s_read_queue_len / (float) m_clk;
