@@ -549,16 +549,18 @@ class DDR5COW : public IDRAM, public Implementation {
 
       // Refresh timings
       // tRFC table (unit is nanosecond!)
+      // 64Gb is not specified by JEDEC JESD79-5C; extrapolated from the 8/16/32Gb trend (D-46, 2026-11-28). Was 820 / 240 / 380 ns.
+      // 128Gb is the old doubling extrapolation and is unused.
       constexpr int tRFC_TABLE[2][5] = {
       //  8Gb   16Gb  32Gb  64Gb  128Gb
-        { 195,  295,  410,  820,  1640 }, // Normal refresh (tRFC1)
-        { 130,  160,  220,  240,   480 }, // FGR 2x (tRFC2)
+        { 195,  295,  410,  550,  1640 }, // Normal refresh (tRFC1)
+        { 130,  160,  220,  300,   480 }, // FGR 2x (tRFC2)
       };
 
       // tRFCsb table (unit is nanosecond!)
       constexpr int tRFCsb_TABLE[1][5] = {
       //  8Gb   16Gb  32Gb  64Gb  128Gb
-	{ 115,  130,  190, 380, 760}, // Normal refresh (tRFC1)
+	{ 115,  130,  190, 250, 760}, // Normal refresh (tRFC1); 64Gb: D-46 (see tRFC_TABLE), 128Gb unused
       };
 
       // tREFI(base) table (unit is nanosecond!)
