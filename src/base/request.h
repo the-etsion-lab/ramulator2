@@ -44,6 +44,9 @@ struct Request {
   int row_class = -1;           // WI-005: row-buffer outcome at the request's first issued command: 0 hit, 1 miss (bank closed), 2 conflict
   bool is_cows_table = false;   // WI-019: a CoWs table read/write (cows_table_access: real); only the CoWs cache sets it
   bool cows_waited_wm = false;  // WI-019: a table read that sat in the read buffer while the controller was in write-drain mode
+  // WI-022 (stats only): a table read's wait before its first command, by cause (controller ticks), and its first-command clock
+  uint32_t cows_wait_wm = 0, cows_wait_busy = 0, cows_wait_notready = 0, cows_wait_ready = 0;
+  Clk_t cows_first_cmd = -1;
 
   Clk_t core2llc = -1;   // Clock cycle when the request arrives at LLC
   Clk_t arrive = -1;   // Clock cycle when the request arrive at the memory controller
