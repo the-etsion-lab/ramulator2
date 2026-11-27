@@ -1,5 +1,6 @@
 #include "dram/dram.h"
 #include "dram/lambdas.h"
+#include <type_traits>   // WI-027: std::extent
 
 namespace Ramulator {
 
@@ -544,6 +545,9 @@ class DDR5COW : public IDRAM, public Implementation {
 	  80,
       };
       if (dq_id == 0) {
+        // WI-027 audit: rate_id is -1 for a rate other than 3200/8000 (only reachable via `timing: rate:`), which read [-1]
+        if (rate_id == -1)
+          throw ConfigurationError("In \"{}\", x4 devices need a rate of 3200 or 8000 MT/s for tCCD_L_WR2 (got {})", get_name(), m_timing_vals("rate"));
         m_timing_vals("nCCDL_WR") = nCCD_L_WR2_TABLE[rate_id];
       }
 
@@ -575,6 +579,14 @@ class DDR5COW : public IDRAM, public Implementation {
           default:    return -1;
         }
       }(m_organization.density);
+      // WI-027: every density-indexed table has one column per supported density (8/16/32/64/128Gb); an unsupported density
+      // would index [-1] (previously unchecked), and the tRRF table had only 3 columns (B12).
+      constexpr int kNumDensities = 5;
+      static_assert(std::extent<decltype(tRFC_TABLE), 1>::value == kNumDensities, "tRFC_TABLE: one column per density");
+      static_assert(std::extent<decltype(tRFCsb_TABLE), 1>::value == kNumDensities, "tRFCsb_TABLE: one column per density");
+      if (density_id < 0 || density_id >= kNumDensities)
+        throw ConfigurationError("In \"{}\", unsupported chip density {} Mb (supported: 8192, 16384, 32768, 65536, 131072)",
+                                 get_name(), m_organization.density);
 
       bool m_high_temp = param<bool>("high_temp").desc("Is operating temperature high? (above 85c)").default_val(false);
 
@@ -590,11 +602,14 @@ class DDR5COW : public IDRAM, public Implementation {
       m_timing_vals("nRFMsb") = m_timing_vals("nRFCsb") * m_RH_radius;
 
       // tRRF table (unit is nanosecond!)
-      constexpr int tRRFsb_TABLE[2][3] = {
-      //  8Gb 16Gb 32Gb
-        { 70,  70,  70 }, // tRRFab
-        { 60,  60,  60 }, // tRRFsb
+      // WI-027 (B12): was [2][3] (8/16/32Gb only) but indexed by density_id up to 4 -> out of bounds for 64/128Gb.
+      // Not specified by JEDEC above 32Gb; carried over (D-46 note).
+      constexpr int tRRFsb_TABLE[2][5] = {
+      //  8Gb 16Gb 32Gb 64Gb 128Gb
+        { 70,  70,  70,  70,  70 }, // tRRFab
+        { 60,  60,  60,  60,  60 }, // tRRFsb
       };
+      static_assert(std::extent<decltype(tRRFsb_TABLE), 1>::value == kNumDensities, "tRRFsb_TABLE: one column per density");
       m_BRC = param_group("RFM").param<int>("BRC").default_val(2);
       m_timing_vals("nDRFMab") = 2 * m_BRC * JEDEC_rounding_DDR5(tRRFsb_TABLE[0][density_id], tCK_ps);
       m_timing_vals("nDRFMsb") = 2 * m_BRC * JEDEC_rounding_DDR5(tRRFsb_TABLE[1][density_id], tCK_ps);
