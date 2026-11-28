@@ -58,6 +58,16 @@ class IDRAMController : public Clocked<IDRAMController> {
     virtual int pending_requests_to_row(const AddrVec_t& addr_vec, const Request* exclude) { return 0; };
 
     /**
+     * @brief       WI-030: true if a request to `rank` is queued in the read, write, priority or active buffer (reads already issued
+     *              and waiting for data do not count). Default false: only GenericDRAMController implements it.
+     */
+    virtual bool rank_has_requests(int rank) { return false; };
+    /**
+     * @brief       WI-030: true if a REFab of `rank` is queued (sent, not yet issued) or in progress (issued < nRFC1 ago).
+     */
+    virtual bool rank_refresh_busy(int rank) { return false; };
+
+    /**
      * @brief       Ticks the memory controller.
      * 
      */

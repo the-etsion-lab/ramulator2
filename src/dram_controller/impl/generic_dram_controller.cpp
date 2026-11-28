@@ -114,6 +114,10 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     uint64_t s_tw_rank_cause[5] = {0, 0, 0, 0, 0};   // refresh / tFAW / tRRD_S / wtr / other
     // WI-028 (D-49): table-reads-ignore-refresh BOUND (diagnostic only) and the per-rank idle-gap histogram
     bool m_ignore_ref_bound = false;
+    // WI-030: per-rank REFab bookkeeping for the postponing refresh manager (state only; maintained unconditionally)
+    int m_cmd_refab_w30 = -1;
+    std::vector<Clk_t> m_ref_busy_until, m_last_refab_issue;
+    std::vector<int> m_ref_queued;
     uint64_t s_bound_picks = 0, s_bound_data_held = 0;
     bool m_idle_gap_stats = false;
     std::vector<Clk_t> m_rank_last_cmd;
@@ -248,6 +252,11 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       m_dram = memory_system->get_ifce<IDRAM>();
       m_bank_addr_idx = m_dram->m_levels("bank");
       m_rank_idx = m_dram->m_levels("rank"); m_cmd_act = m_dram->m_commands("ACT"); m_cmd_rd = m_dram->m_commands("RD");   // WI-022
+      {   // WI-030 (state only, unconditional; review C1)
+        int R = m_dram->get_level_size("rank");
+        m_cmd_refab_w30 = m_dram->m_commands("REFab");
+        m_ref_busy_until.assign(R, -1); m_ref_queued.assign(R, 0); m_last_refab_issue.assign(R, -1);
+      }
       if (m_ignore_ref_bound && !m_cows_table)
         throw ConfigurationError("cows_table_ignore_refresh (WI-028 BOUND ONLY) needs real table access (cows_table_priority)");
       if (m_ignore_ref_bound) {   // WI-028 BOUND ONLY
@@ -487,7 +496,24 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
 
       bool is_success = false;
       is_success = m_priority_buffer.enqueue(req);
+      if (is_success && req.final_command == m_cmd_refab_w30 && req.addr_vec[m_rank_idx] >= 0) m_ref_queued[req.addr_vec[m_rank_idx]]++;   // WI-030
       return is_success;
+    }
+
+    // WI-030 queries for the postponing refresh manager (state only; no timing effect)
+    bool rank_has_requests(int rank) override {
+      for (auto* b : {&m_read_buffer, &m_write_buffer, &m_priority_buffer, &m_active_buffer})
+        for (auto& r : *b) if (r.addr_vec[m_rank_idx] == rank) return true;
+      return false;
+    }
+    bool rank_refresh_busy(int rank) override { return m_ref_queued[rank] > 0 || m_clk < m_ref_busy_until[rank]; }
+    // at REFab issue the REFab itself is still the priority-buffer head: exclude it
+    bool rank_has_requests_except_head(int rank) {
+      for (auto* b : {&m_read_buffer, &m_write_buffer, &m_active_buffer})
+        for (auto& r : *b) if (r.addr_vec[m_rank_idx] == rank) return true;
+      bool first = true;
+      for (auto& r : m_priority_buffer) { if (first) { first = false; continue; } if (r.addr_vec[m_rank_idx] == rank) return true; }
+      return false;
     }
 
     void tick() override {
@@ -559,6 +585,15 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         }
         m_dram->issue_command(req_it->command, req_it->addr_vec);
         if (m_cows_table) note_rank_cmd(req_it->command, req_it->addr_vec);   // WI-022 (stats only)
+        if (req_it->command == m_cmd_refab_w30) {   // WI-030 (unconditional state; review C1)
+          int rk = req_it->addr_vec[m_rank_idx];
+          if (rk >= 0) {
+            if (m_last_refab_issue[rk] >= 0 && m_clk - m_last_refab_issue[rk] < m_dram->m_timing_vals("nRFC1"))
+              throw std::runtime_error("WI-030 invariant: two REFab of a rank closer than nRFC1");
+            m_last_refab_issue[rk] = m_clk; m_ref_busy_until[rk] = m_clk + m_dram->m_timing_vals("nRFC1"); m_ref_queued[rk]--;
+            m_refresh->refab_issued(rk, m_clk, !rank_has_requests_except_head(rk));
+          }
+        }
         if (m_idle_gap_stats) {   // WI-028: gaps between consecutive non-refresh commands to a rank (REFab / PREA excluded),
           int rk = req_it->addr_vec[m_rank_idx];  // split into gaps that contain a REFab of the rank (the refresh itself) and refresh-free gaps
           const auto& c = m_dram->m_commands;
