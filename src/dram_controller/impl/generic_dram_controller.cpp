@@ -117,8 +117,13 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     uint64_t s_bound_picks = 0, s_bound_data_held = 0;
     bool m_idle_gap_stats = false;
     std::vector<Clk_t> m_rank_last_cmd;
-    std::map<uint64_t, uint64_t> m_idle_gap_hist;
-    uint64_t s_idle_gap_n = 0, s_idle_gap_sum = 0, s_idle_gap_ge_rfc_sum = 0;
+    std::vector<bool> m_rank_gap_has_ref;                      // a REFab to this rank was issued inside the current gap
+    std::vector<std::vector<Clk_t>> m_rank_ref_times;          // post-warmup REFab issue clocks per rank
+    std::vector<std::vector<std::pair<Clk_t, Clk_t>>> m_rank_free_gaps;   // refresh-free gaps >= nRFC1 per rank (start, end)
+    std::map<uint64_t, uint64_t> m_idle_gap_hist;              // refresh-free gaps only
+    uint64_t s_idle_gap_n = 0, s_idle_gap_sum = 0, s_idle_gap_ge_rfc_sum = 0;   // refresh-free gaps
+    uint64_t s_idle_gap_ref_n = 0, s_idle_gap_ref_sum = 0;                      // gaps that contain a REFab of the rank
+    uint64_t s_refab_windows = 0, s_refab_postponable = 0;
     float s_idle_gap_p50 = 0, s_idle_gap_p90 = 0, s_idle_gap_max = 0;
     LatHist m_tw_occ;   // review H1: target bank occupied = bank_busy + notready blocked at the bank level
     // WI-021 `first_drain`: a ready table read may bypass a write drain, while (a) the write buffer is below kWriteBypassLimit
@@ -235,6 +240,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       m_table_read_lat_hist.clear();   // WI-019
       for (auto* x : {&m_tw, &m_tw_wm, &m_tw_rm, &m_tw_busy, &m_tw_occ, &m_tsvc}) x->h.clear();   // WI-022 (sums are registered)
       m_idle_gap_hist.clear();   // WI-028
+      for (auto& v : m_rank_ref_times) v.clear();
+      for (auto& v : m_rank_free_gaps) v.clear();
     }
 
     void setup(IFrontEnd* frontend, IMemorySystem* memory_system) override {
@@ -248,13 +255,18 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         register_stat(s_bound_data_held).name("BOUND_ONLY_other_requests_held_in_refresh_{}", m_channel_id);
       }
       if (m_idle_gap_stats) {   // WI-028
-        m_rank_last_cmd.assign(m_dram->get_level_size("rank"), -1);
-        register_stat(s_idle_gap_n).name("rank_idle_gaps_{}", m_channel_id);
-        register_stat(s_idle_gap_sum).name("rank_idle_gap_sum_{}", m_channel_id);
-        register_stat(s_idle_gap_ge_rfc_sum).name("rank_idle_gap_sum_ge_nRFC1_{}", m_channel_id);
-        register_stat(s_idle_gap_p50).name("rank_idle_gap_p50_{}", m_channel_id);
-        register_stat(s_idle_gap_p90).name("rank_idle_gap_p90_{}", m_channel_id);
-        register_stat(s_idle_gap_max).name("rank_idle_gap_max_{}", m_channel_id);
+        int R = m_dram->get_level_size("rank");
+        m_rank_last_cmd.assign(R, -1); m_rank_gap_has_ref.assign(R, false); m_rank_ref_times.resize(R); m_rank_free_gaps.resize(R);
+        register_stat(s_idle_gap_n).name("rank_idle_gaps_refresh_free_{}", m_channel_id);
+        register_stat(s_idle_gap_sum).name("rank_idle_gap_sum_refresh_free_{}", m_channel_id);
+        register_stat(s_idle_gap_ge_rfc_sum).name("rank_idle_gap_sum_refresh_free_ge_nRFC1_{}", m_channel_id);
+        register_stat(s_idle_gap_p50).name("rank_idle_gap_refresh_free_p50_{}", m_channel_id);
+        register_stat(s_idle_gap_p90).name("rank_idle_gap_refresh_free_p90_{}", m_channel_id);
+        register_stat(s_idle_gap_max).name("rank_idle_gap_refresh_free_max_{}", m_channel_id);
+        register_stat(s_idle_gap_ref_n).name("rank_idle_gaps_with_refab_{}", m_channel_id);
+        register_stat(s_idle_gap_ref_sum).name("rank_idle_gap_sum_with_refab_{}", m_channel_id);
+        register_stat(s_refab_windows).name("rank_refab_windows_{}", m_channel_id);
+        register_stat(s_refab_postponable).name("rank_refab_fit_in_free_gap_within_4_postponed_{}", m_channel_id);
       }
 
       m_auto_precharge = param<bool>("auto_precharge")
@@ -547,16 +559,22 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         }
         m_dram->issue_command(req_it->command, req_it->addr_vec);
         if (m_cows_table) note_rank_cmd(req_it->command, req_it->addr_vec);   // WI-022 (stats only)
-        if (m_idle_gap_stats) {   // WI-028: gaps between consecutive non-refresh commands to a rank (REFab / PREA excluded)
-          int rk = req_it->addr_vec[m_rank_idx];
+        if (m_idle_gap_stats) {   // WI-028: gaps between consecutive non-refresh commands to a rank (REFab / PREA excluded),
+          int rk = req_it->addr_vec[m_rank_idx];  // split into gaps that contain a REFab of the rank (the refresh itself) and refresh-free gaps
           const auto& c = m_dram->m_commands;
-          if (rk >= 0 && req_it->command != c("REFab") && req_it->command != c("PREA")) {
+          if (rk >= 0 && req_it->command == c("REFab")) { m_rank_gap_has_ref[rk] = true; m_rank_ref_times[rk].push_back(m_clk); }
+          else if (rk >= 0 && req_it->command != c("PREA")) {
             if (m_rank_last_cmd[rk] >= 0) {
               uint64_t g = m_clk - m_rank_last_cmd[rk];
-              m_idle_gap_hist[g]++; s_idle_gap_n++; s_idle_gap_sum += g;
-              if (g >= (uint64_t)m_dram->m_timing_vals("nRFC1")) s_idle_gap_ge_rfc_sum += g;
+              if (m_rank_gap_has_ref[rk]) { s_idle_gap_ref_n++; s_idle_gap_ref_sum += g; }
+              else {
+                m_idle_gap_hist[g]++; s_idle_gap_n++; s_idle_gap_sum += g;
+                if (g >= (uint64_t)m_dram->m_timing_vals("nRFC1")) {
+                  s_idle_gap_ge_rfc_sum += g; m_rank_free_gaps[rk].push_back({m_rank_last_cmd[rk], m_clk});
+                }
+              }
             }
-            m_rank_last_cmd[rk] = m_clk;
+            m_rank_last_cmd[rk] = m_clk; m_rank_gap_has_ref[rk] = false;
           }
         }
 
@@ -912,6 +930,23 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         for (auto* x : {&m_tw, &m_tw_wm, &m_tw_rm, &m_tw_busy, &m_tw_occ, &m_tsvc}) x->fin();   // WI-022 item 1
       }
       if (m_idle_gap_stats) {   // WI-028
+        // Postponement estimate (approximate; traffic as simulated): each post-warmup REFab, in time order, takes the earliest nRFC1 slot
+        // inside a refresh-free gap of its rank that starts no earlier than the REFab and no later than 4 x nREFI after it (DDR5 allows
+        // up to 4 postponed REFab). Slots are not reused.
+        Clk_t nrfc = m_dram->m_timing_vals("nRFC1"), nrefi = m_dram->m_timing_vals("nREFI");
+        for (size_t rk = 0; rk < m_rank_ref_times.size(); rk++) {
+          auto& gaps = m_rank_free_gaps[rk]; std::vector<Clk_t> used(gaps.size());
+          for (size_t i = 0; i < gaps.size(); i++) used[i] = gaps[i].first;
+          size_t lo = 0;
+          for (Clk_t t : m_rank_ref_times[rk]) {
+            s_refab_windows++;
+            while (lo < gaps.size() && gaps[lo].second < t + nrfc) lo++;
+            for (size_t i = lo; i < gaps.size() && gaps[i].first <= t + 4 * nrefi; i++) {
+              Clk_t s = std::max(t, used[i]);
+              if (s + nrfc <= gaps[i].second && s <= t + 4 * nrefi) { used[i] = s + nrfc; s_refab_postponable++; break; }
+            }
+          }
+        }
         uint64_t acc = 0; bool f50 = false;
         for (auto& [g, c] : m_idle_gap_hist) {
           acc += c;
