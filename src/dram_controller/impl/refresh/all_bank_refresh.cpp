@@ -24,6 +24,8 @@ class AllBankRefresh : public IRefreshManager, public Implementation {
     // every nREFI, so the C*R ranks refresh evenly spread over the interval. Rank-major order (review D1): the ranks of one channel are
     // nREFI/R apart, so (with nRFC1 < nREFI/R) they are never in refresh at the same time. `none` (default) = stock lockstep behaviour.
     bool m_stagger = false;
+    bool m_dimm = false;      // WI-028: same phases in every channel, the R ranks of a channel nREFI/R apart
+    bool m_enabled = true;    // WI-028
     std::vector<Clk_t> m_next_rank;
     std::vector<uint64_t> s_refab_sent;     // per rank, whole run (not reset at warmup)
     std::vector<uint64_t> s_first_refresh;  // per rank
@@ -32,9 +34,11 @@ class AllBankRefresh : public IRefreshManager, public Implementation {
   public:
     void init() override { 
       m_ctrl = cast_parent<IDRAMController>();
-      std::string s = param<std::string>("stagger").desc("WI-026: none (stock, all ranks at once) | rank").default_val("none");
-      if (s != "none" && s != "rank") throw ConfigurationError("AllBank stagger must be none or rank (got {})", s);
-      m_stagger = s == "rank";
+      std::string s = param<std::string>("stagger").desc("WI-026: none (stock, all ranks at once) | rank | dimm (WI-028)").default_val("none");
+      if (s != "none" && s != "rank" && s != "dimm") throw ConfigurationError("AllBank stagger must be none, rank or dimm (got {})", s);
+      m_stagger = s != "none"; m_dimm = s == "dimm";
+      // WI-028: `enabled: false` issues no REFab at all (the no-refresh row of the bracket; no other refresh manager exists)
+      m_enabled = param<bool>("enabled").desc("WI-028: false = issue no refresh at all (diagnostic bracket)").default_val(true);
     };
 
     void setup(IFrontEnd* frontend, IMemorySystem* memory_system) override {
@@ -52,7 +56,8 @@ class AllBankRefresh : public IRefreshManager, public Implementation {
         register_stat(s_clk, false).name("refresh_clk_ch{}", c);
         m_next_rank.resize(m_num_ranks); s_refab_sent.assign(m_num_ranks, 0); s_first_refresh.assign(m_num_ranks, 0);
         for (int r = 0; r < m_num_ranks; r++) {
-          m_next_rank[r] = m_nrefi + (Clk_t)((int64_t)m_nrefi * (r * C + c) / ((int64_t)C * m_num_ranks));   // review D1: rank-major
+          m_next_rank[r] = m_dimm ? m_nrefi + (Clk_t)((int64_t)m_nrefi * r / m_num_ranks)   // WI-028 dimm: channel-independent
+                                  : m_nrefi + (Clk_t)((int64_t)m_nrefi * (r * C + c) / ((int64_t)C * m_num_ranks));   // review D1: rank-major
           s_first_refresh[r] = m_next_rank[r];
           register_stat(s_refab_sent[r], false).name("refab_sent_ch{}_rank{}", c, r);
           register_stat(s_first_refresh[r], false).name("first_refresh_cycle_ch{}_rank{}", c, r);
@@ -62,6 +67,7 @@ class AllBankRefresh : public IRefreshManager, public Implementation {
 
     void tick() {
       m_clk++;
+      if (!m_enabled) return;   // WI-028: no refresh
 
       if (m_stagger) {   // WI-026: per-rank schedule
         s_clk = m_clk;

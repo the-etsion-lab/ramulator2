@@ -104,14 +104,22 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     };
     LatHist m_tw, m_tw_wm, m_tw_rm, m_tw_busy, m_tsvc;
     uint64_t s_tw_notready = 0, s_tw_ready = 0, s_tw_busy_pre_ready = 0, s_tw_nr_bank = 0;
-    uint64_t s_tw_nr_level[3] = {0, 0, 0};
+    uint64_t s_tw_nr_level[3] = {0, 0, 0};   // notready ticks blocked at level 0..2 (channel / rank / bankgroup), non-exclusive
     // PI 2026-11-28: cause of rank-level blocking, reconstructed from this channel's issued commands per rank (stats only).
     // First match: refresh (REFab/RFMab within nRFC1/nRFM1) > tFAW (4th-last ACT + nFAW) > tRRD_S (last ACT + nRRDS) >
     // write->read turnaround (RD blocked within nCCDS_WTR of the rank's last WR/WRA) > other (tCCD_S, sibling-rank, PREA).
     struct RankHist { Clk_t ref_end = -1; Clk_t act[4] = {-1, -1, -1, -1}; int act_i = 0; Clk_t last_wr = -1; };
     std::map<int, RankHist> m_rank_hist;
     int m_rank_idx = -1, m_cmd_act = -1, m_cmd_rd = -1;
-    uint64_t s_tw_rank_cause[5] = {0, 0, 0, 0, 0};   // notready ticks blocked at level 0..2 (channel / rank / bankgroup), non-exclusive
+    uint64_t s_tw_rank_cause[5] = {0, 0, 0, 0, 0};   // refresh / tFAW / tRRD_S / wtr / other
+    // WI-028 (D-49): table-reads-ignore-refresh BOUND (diagnostic only) and the per-rank idle-gap histogram
+    bool m_ignore_ref_bound = false;
+    uint64_t s_bound_picks = 0, s_bound_data_held = 0;
+    bool m_idle_gap_stats = false;
+    std::vector<Clk_t> m_rank_last_cmd;
+    std::map<uint64_t, uint64_t> m_idle_gap_hist;
+    uint64_t s_idle_gap_n = 0, s_idle_gap_sum = 0, s_idle_gap_ge_rfc_sum = 0;
+    float s_idle_gap_p50 = 0, s_idle_gap_p90 = 0, s_idle_gap_max = 0;
     LatHist m_tw_occ;   // review H1: target bank occupied = bank_busy + notready blocked at the bank level
     // WI-021 `first_drain`: a ready table read may bypass a write drain, while (a) the write buffer is below kWriteBypassLimit
     // (= max_size; ReqBuffer::enqueue accepts up to max_size + 1, so this is a slightly conservative hard limit) and (b) fewer than
@@ -166,6 +174,13 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       m_controller_stats_name += "_";
       m_dump_raw_latency = param<bool>("dump_raw_latency_samples")
         .desc("Write the raw per-request latency sample files (large).").default_val(true);
+      // WI-028 (D-49): BOUND ONLY, NOT A DESIGN. Table READs may issue while their rank is in all-bank refresh (the REFab->ACT nRFC1
+      // constraint is skipped for them; tRRD_S/tFAW and every other constraint still apply); other requests to a refreshing rank are
+      // held back. Requires cows_table_priority (real table access). Default false = unchanged.
+      m_ignore_ref_bound = param<bool>("cows_table_ignore_refresh")
+        .desc("WI-028 BOUND ONLY (not a design): table reads ignore all-bank refresh").default_val(false);
+      // WI-028: per-rank idle-gap histogram (gaps between consecutive commands issued to a rank). Stats only, default off.
+      m_idle_gap_stats = param<bool>("rank_idle_gap_stats").desc("WI-028: per-rank command idle-gap histogram").default_val(false);
 
       {   // WI-019
         std::string tp = param<std::string>("cows_table_priority")
@@ -219,12 +234,28 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       m_read_lat_by_class.clear();   // registered sums/counts are reset by the stats system
       m_table_read_lat_hist.clear();   // WI-019
       for (auto* x : {&m_tw, &m_tw_wm, &m_tw_rm, &m_tw_busy, &m_tw_occ, &m_tsvc}) x->h.clear();   // WI-022 (sums are registered)
+      m_idle_gap_hist.clear();   // WI-028
     }
 
     void setup(IFrontEnd* frontend, IMemorySystem* memory_system) override {
       m_dram = memory_system->get_ifce<IDRAM>();
       m_bank_addr_idx = m_dram->m_levels("bank");
       m_rank_idx = m_dram->m_levels("rank"); m_cmd_act = m_dram->m_commands("ACT"); m_cmd_rd = m_dram->m_commands("RD");   // WI-022
+      if (m_ignore_ref_bound && !m_cows_table)
+        throw ConfigurationError("cows_table_ignore_refresh (WI-028 BOUND ONLY) needs real table access (cows_table_priority)");
+      if (m_ignore_ref_bound) {   // WI-028 BOUND ONLY
+        register_stat(s_bound_picks).name("BOUND_ONLY_table_reads_issued_in_refresh_{}", m_channel_id);
+        register_stat(s_bound_data_held).name("BOUND_ONLY_other_requests_held_in_refresh_{}", m_channel_id);
+      }
+      if (m_idle_gap_stats) {   // WI-028
+        m_rank_last_cmd.assign(m_dram->get_level_size("rank"), -1);
+        register_stat(s_idle_gap_n).name("rank_idle_gaps_{}", m_channel_id);
+        register_stat(s_idle_gap_sum).name("rank_idle_gap_sum_{}", m_channel_id);
+        register_stat(s_idle_gap_ge_rfc_sum).name("rank_idle_gap_sum_ge_nRFC1_{}", m_channel_id);
+        register_stat(s_idle_gap_p50).name("rank_idle_gap_p50_{}", m_channel_id);
+        register_stat(s_idle_gap_p90).name("rank_idle_gap_p90_{}", m_channel_id);
+        register_stat(s_idle_gap_max).name("rank_idle_gap_max_{}", m_channel_id);
+      }
 
       m_auto_precharge = param<bool>("auto_precharge")
         .desc("Strict closed-row: serve every read/write with RDA/WRA (auto-precharge).").default_val(false);
@@ -516,6 +547,18 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         }
         m_dram->issue_command(req_it->command, req_it->addr_vec);
         if (m_cows_table) note_rank_cmd(req_it->command, req_it->addr_vec);   // WI-022 (stats only)
+        if (m_idle_gap_stats) {   // WI-028: gaps between consecutive non-refresh commands to a rank (REFab / PREA excluded)
+          int rk = req_it->addr_vec[m_rank_idx];
+          const auto& c = m_dram->m_commands;
+          if (rk >= 0 && req_it->command != c("REFab") && req_it->command != c("PREA")) {
+            if (m_rank_last_cmd[rk] >= 0) {
+              uint64_t g = m_clk - m_rank_last_cmd[rk];
+              m_idle_gap_hist[g]++; s_idle_gap_n++; s_idle_gap_sum += g;
+              if (g >= (uint64_t)m_dram->m_timing_vals("nRFC1")) s_idle_gap_ge_rfc_sum += g;
+            }
+            m_rank_last_cmd[rk] = m_clk;
+          }
+        }
 
         // If we are issuing the last command, set depart clock cycle and move the request to the pending queue
         if (req_it->command == req_it->final_command) {
@@ -573,6 +616,25 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       else if (cmd == c("RFMab")) h.ref_end = std::max<Clk_t>(h.ref_end, m_clk + m_dram->m_timing_vals("nRFM1"));
       else if (cmd == m_cmd_act) { h.act[h.act_i] = m_clk; h.act_i = (h.act_i + 1) & 3; }
       else if (cmd == c("WR") || cmd == c("WRA")) h.last_wr = m_clk;
+    }
+    // WI-028 BOUND ONLY helpers (from the WI-022 per-rank history; needs m_cows_table)
+    bool rank_in_refresh(int rk) {
+      if (rk < 0) return false;
+      auto it = m_rank_hist.find(rk);
+      return it != m_rank_hist.end() && m_clk < it->second.ref_end;
+    }
+    // ready if nothing but the rank-level REFab constraint blocks the command: levels below / above the rank must be ready; at the rank
+    // only an ACT is affected by REFab (REFab -> ACT nRFC1), so for an ACT re-check the rank's tRRD_S / tFAW from the history.
+    bool ready_ignoring_refresh(int cmd, const AddrVec_t& av, int rk) {
+      int bm = m_dram->check_ready_block_mask(cmd, av);
+      if (bm == 0) return true;
+      if (bm & ~(1 << m_rank_idx)) return false;
+      if (cmd != m_cmd_act) return false;
+      const auto& h = m_rank_hist[rk];
+      Clk_t oldest = h.act[h.act_i], last = h.act[(h.act_i + 3) & 3];
+      if (oldest >= 0 && m_clk < oldest + m_dram->m_timing_vals("nFAW")) return false;
+      if (last >= 0 && m_clk < last + m_dram->m_timing_vals("nRRDS")) return false;
+      return true;
     }
     int rank_cause(int pc, int rk) {   // 0 refresh, 1 tFAW, 2 tRRD_S, 3 write->read turnaround, 4 other
       auto it = m_rank_hist.find(rk);
@@ -766,6 +828,18 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
               break;
             }
           }
+          if (!request_found && m_ignore_ref_bound && !m_is_write_mode) {   // WI-028 BOUND ONLY (not a design): see init()
+            for (auto it = m_read_buffer.begin(); it != m_read_buffer.end(); it++) {
+              if (!it->is_cows_table) continue;
+              int rk = it->addr_vec[m_rank_idx];
+              if (!rank_in_refresh(rk)) continue;
+              it->command = m_dram->get_preq_command(it->final_command, it->addr_vec);
+              if (ready_ignoring_refresh(it->command, it->addr_vec, rk)) {
+                req_it = it; request_found = true; req_buffer = &m_read_buffer; s_bound_picks++;
+                break;
+              }
+            }
+          }
           if (!request_found && m_cows_table_first && !m_is_write_mode) {   // WI-019 `first`: the oldest table read whose NEXT command is ready
             for (auto it = m_read_buffer.begin(); it != m_read_buffer.end(); it++) {
               if (!it->is_cows_table) continue;
@@ -785,6 +859,11 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         }
       }
 
+      // WI-028 BOUND ONLY: while a rank is in refresh only table READs may use it (a table ACT may have reopened a bank there)
+      if (request_found && m_ignore_ref_bound && req_buffer != &m_priority_buffer &&
+          !(req_it->is_cows_table && req_it->type_id == Request::Type::Read) && rank_in_refresh(req_it->addr_vec[m_rank_idx])) {
+        request_found = false; s_bound_data_held++;
+      }
       // 2.3 If we find a request to schedule, we need to check if it will close an opened row in the active buffer.
       if (request_found) {
         if (m_dram->m_command_meta(req_it->command).is_closing) {
@@ -831,6 +910,15 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         }
         s_data_read_lat_mean = s_data_reads ? (float)s_data_read_lat_sum / s_data_reads : 0;
         for (auto* x : {&m_tw, &m_tw_wm, &m_tw_rm, &m_tw_busy, &m_tw_occ, &m_tsvc}) x->fin();   // WI-022 item 1
+      }
+      if (m_idle_gap_stats) {   // WI-028
+        uint64_t acc = 0; bool f50 = false;
+        for (auto& [g, c] : m_idle_gap_hist) {
+          acc += c;
+          if (!f50 && acc * 2 >= s_idle_gap_n) { s_idle_gap_p50 = g; f50 = true; }
+          if (s_idle_gap_p90 == 0 && acc * 10 >= s_idle_gap_n * 9) s_idle_gap_p90 = g;
+          s_idle_gap_max = g;
+        }
       }
 
       s_queue_len_avg = (float) s_queue_len / (float) m_clk;
